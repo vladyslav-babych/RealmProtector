@@ -120,6 +120,9 @@ have been expanded and hardened.
 
 ### Fixed
 
+- Fixed CI dependency auditing to scan the hash-locked third-party runtime set
+  instead of treating the unpublished local application package as a PyPI
+  dependency.
 - Fixed party-thread auto signup by resolving Discord's thread-starter wrapper
   back to the editable parent message. Self and caller-forced signups now enforce
   one role per member in each party and normalize both Discord mention formats.

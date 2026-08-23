@@ -47,5 +47,12 @@ jobs:
         run: coverage run -m unittest discover -s tests -v
       - name: Coverage report
         run: coverage report
-      - name: Dependency audit
-        run: pip-audit --strict
+      - name: Audit hash-locked production dependencies
+        if: matrix.python-version == '3.14'
+        run: >-
+          pip-audit
+          --strict
+          --require-hashes
+          --disable-pip
+          --progress-spinner off
+          -r requirements.lock

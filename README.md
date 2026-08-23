@@ -119,7 +119,7 @@ Run the same static gates as CI:
 ruff check .
 ruff format --check .
 mypy src main.py scripts
-pip-audit --strict
+pip-audit --strict --require-hashes --disable-pip -r requirements.lock
 ```
 
 The test suite covers the preserved command surface, import-safe startup, SQLite
