@@ -1653,7 +1653,7 @@ def import_player(
 
     When a local registration already exists, no player field is accepted from
     the bootstrap snapshot. Nickname, membership, Silver, and cached Siphon all
-    remain authoritative locally until the strict post-bootstrap Siphon refresh.
+    remain authoritative locally until an explicit Siphon synchronization.
     """
 
     _validate_identifier(guild_id, "guild_id")

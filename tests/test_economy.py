@@ -29,6 +29,10 @@ class EconomyMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
                     nickname="Credited",
                     discord_user_id=111,
                 ),
+                SimpleNamespace(
+                    nickname="Also credited",
+                    discord_user_id=222,
+                ),
             ),
             missing_nicknames=("<@999>",),
         )
@@ -41,8 +45,8 @@ class EconomyMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(economy_commands.discord, "Member", FakeMember),
             patch.object(
-                economy_commands,
-                "_has_economy_access",
+                economy_commands.economy_access,
+                "has_economy_access",
                 new=AsyncMock(return_value=True),
             ),
             patch.object(
@@ -70,6 +74,11 @@ class EconomyMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "send_followup_lines",
                 new=AsyncMock(),
             ) as send_lines,
+            patch.object(
+                economy_commands,
+                "_project_linked_players_after_commit",
+                new=AsyncMock(return_value=None),
+            ) as project_players,
         ):
             await lootsplit.callback(
                 interaction,
@@ -82,11 +91,178 @@ class EconomyMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         send_lines.assert_awaited_once()
+        project_players.assert_awaited_once_with(30, (111, 222))
         allowed_mentions = send_lines.await_args.kwargs["allowed_mentions"]
-        self.assertEqual([111], [user.id for user in allowed_mentions.users])
+        self.assertEqual([111, 222], [user.id for user in allowed_mentions.users])
         self.assertFalse(allowed_mentions.roles)
         self.assertFalse(allowed_mentions.everyone)
         self.assertFalse(allowed_mentions.replied_user)
+
+
+class EconomyProjectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_balance_change_projects_linked_player_after_local_commit(
+        self,
+    ) -> None:
+        class FakeMember:
+            def __init__(self, member_id: int, name: str) -> None:
+                self.id = member_id
+                self.display_name = name
+                self.mention = f"<@{member_id}>"
+
+        actor = FakeMember(10, "Officer")
+        target = FakeMember(20, "Player")
+        interaction = SimpleNamespace(
+            id=99,
+            guild=SimpleNamespace(id=30),
+            user=actor,
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        result = SimpleNamespace(
+            actual_delta=3,
+            previous_balance=0,
+            updated_balance=3,
+        )
+        pending = economy_commands.google_sync.SyncResult(
+            False,
+            "pending",
+            incomplete=True,
+        )
+        command = next(
+            item
+            for item in economy_commands.create_economy_commands(SimpleNamespace())
+            if item.name == "bal-add"
+        )
+        with (
+            patch.object(economy_commands.discord, "Member", FakeMember),
+            patch.object(
+                economy_commands.economy_access,
+                "has_economy_access",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                economy_commands,
+                "_ensure_local_ledger_ready",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(economy_commands, "_active_ledger_id", return_value=30),
+            patch.object(
+                economy_commands,
+                "_resolve_member_local_name",
+                return_value="Officer",
+            ),
+            patch.object(
+                economy_commands.local_repository,
+                "change_balance",
+                return_value=result,
+            ) as change_balance,
+            patch.object(
+                economy_commands,
+                "_project_linked_players_after_commit",
+                new=AsyncMock(return_value=pending),
+            ) as project_players,
+        ):
+            await command.callback(interaction, target, "3", "Manual")
+
+        change_balance.assert_called_once()
+        project_players.assert_awaited_once_with(30, (20,))
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        self.assertIn("Google Sheet update is queued", embed.footer.text)
+
+    async def test_negative_siphon_reads_only_current_active_local_cache(self) -> None:
+        class FakeMember:
+            id = 10
+
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=30),
+            user=FakeMember(),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        command = next(
+            item
+            for item in economy_commands.create_economy_commands(SimpleNamespace())
+            if item.name == "get-negative-siphon"
+        )
+        with (
+            patch.object(economy_commands.discord, "Member", FakeMember),
+            patch.object(
+                economy_commands.economy_access,
+                "has_economy_access",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                economy_commands,
+                "_ensure_local_ledger_ready",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                economy_commands.credential_store,
+                "get_credentials_info",
+                return_value={"status": "active"},
+            ),
+            patch.object(economy_commands, "_active_ledger_id", return_value=30),
+            patch.object(
+                economy_commands.local_repository,
+                "list_negative_siphon",
+                return_value=[],
+            ) as list_negative,
+            patch.object(
+                economy_commands.google_sync,
+                "sync_siphon_from_sheet",
+                new=AsyncMock(),
+            ) as remote_sync,
+        ):
+            await command.callback(interaction)
+
+        list_negative.assert_called_once_with(30, active_only=True)
+        remote_sync.assert_not_awaited()
+        self.assertIn("/sync-siphon", interaction.followup.send.await_args.args[0])
+
+    async def test_negative_siphon_does_not_use_cache_without_an_active_sheet(self) -> None:
+        class FakeMember:
+            id = 10
+
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=30),
+            user=FakeMember(),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        command = next(
+            item
+            for item in economy_commands.create_economy_commands(SimpleNamespace())
+            if item.name == "get-negative-siphon"
+        )
+        with (
+            patch.object(economy_commands.discord, "Member", FakeMember),
+            patch.object(
+                economy_commands.economy_access,
+                "has_economy_access",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                economy_commands,
+                "_ensure_local_ledger_ready",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                economy_commands.credential_store,
+                "get_credentials_info",
+                return_value=None,
+            ),
+            patch.object(
+                economy_commands.local_repository,
+                "list_negative_siphon",
+            ) as list_negative,
+        ):
+            await command.callback(interaction)
+
+        list_negative.assert_not_called()
+        self.assertIn(
+            "active Google Sheet link",
+            interaction.followup.send.await_args.args[0],
+        )
 
 
 class EconomyDisplayTests(unittest.IsolatedAsyncioTestCase):

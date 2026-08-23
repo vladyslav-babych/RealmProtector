@@ -1,4 +1,4 @@
-"""Administrator-only commands for observing and repairing Sheet projection."""
+"""Commands for importing Siphon and administering the Sheet projection."""
 
 from __future__ import annotations
 
@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING
 import discord
 from discord import app_commands
 
-from src.realm_protector.services import google_sync, sync_operations
+from src.realm_protector.services import (
+    economy_access,
+    google_sync,
+    request_limits,
+    sync_operations,
+)
 from src.realm_protector.services.authorization import is_admin
 
 if TYPE_CHECKING:
@@ -17,6 +22,7 @@ if TYPE_CHECKING:
 
 
 LOGGER = logging.getLogger(__name__)
+_SIPHON_SYNC_COOLDOWN = request_limits.Cooldown(30)
 
 
 async def _require_admin_guild(interaction: discord.Interaction) -> int | None:
@@ -29,6 +35,24 @@ async def _require_admin_guild(interaction: discord.Interaction) -> int | None:
         )
         return None
     if not await is_admin(member):
+        await interaction.response.send_message(
+            "You don't have permission to use this command.",
+            ephemeral=True,
+        )
+        return None
+    return guild.id
+
+
+async def _require_economy_guild(interaction: discord.Interaction) -> int | None:
+    guild = interaction.guild
+    member = interaction.user
+    if guild is None or not isinstance(member, discord.Member):
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return None
+    if not await economy_access.has_economy_access(member, guild.id):
         await interaction.response.send_message(
             "You don't have permission to use this command.",
             ephemeral=True,
@@ -68,7 +92,7 @@ def _format_sync_health(health: sync_operations.SyncHealth) -> str:
             "Current Siphon cache: "
             f"{health.current_siphon_players}/{health.active_players} active players"
         ),
-        f"Latest Siphon refresh: {health.latest_siphon_sync_at or 'never'}",
+        f"Latest manual Siphon synchronization: {health.latest_siphon_sync_at or 'never'}",
     ]
     if health.quarantine_reason:
         lines.append(f"Link quarantine reason: {health.quarantine_reason}")
@@ -76,6 +100,42 @@ def _format_sync_health(health: sync_operations.SyncHealth) -> str:
 
 
 def create_sync_commands(bot: "RealmProtectorBot") -> list[app_commands.Command]:
+    @app_commands.command(
+        name="sync-siphon",
+        description="Import current Siphon values from Google Sheets",
+    )
+    @app_commands.guild_only()
+    async def sync_siphon(interaction: discord.Interaction) -> None:
+        guild_id = await _require_economy_guild(interaction)
+        if guild_id is None:
+            return
+        retry_after = _SIPHON_SYNC_COOLDOWN.claim((guild_id, interaction.user.id))
+        if retry_after:
+            await interaction.response.send_message(
+                f"Please wait {max(1, int(retry_after) + 1)} seconds before synchronizing Siphon again.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await google_sync.sync_siphon_from_sheet(guild_id)
+        except Exception:
+            LOGGER.exception("Siphon synchronization failed for guild %s", guild_id)
+            await interaction.followup.send(
+                "Siphon synchronization failed unexpectedly. Check the bot logs.",
+                ephemeral=True,
+            )
+            return
+        outcome = "completed" if result.success else "incomplete"
+        await interaction.followup.send(
+            (
+                f"Siphon synchronization **{outcome}**: "
+                f"{result.updated_siphon_rows}/{result.expected_siphon_rows} "
+                f"active player(s) updated.\n{result.message}"
+            ),
+            ephemeral=True,
+        )
+
     @app_commands.command(
         name="sync-status",
         description="Show local-to-Google projection health (admin only)",
@@ -158,7 +218,7 @@ def create_sync_commands(bot: "RealmProtectorBot") -> list[app_commands.Command]
             ephemeral=True,
         )
 
-    return [sync_status, sync_retry, sync_rebuild]
+    return [sync_siphon, sync_status, sync_retry, sync_rebuild]
 
 
 __all__ = ["create_sync_commands"]

@@ -7,7 +7,8 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 from src.realm_protector.infrastructure import (
     guild_settings,
@@ -18,28 +19,29 @@ from src.realm_protector.services import google_sync
 
 
 class FakeWorksheet:
-    def __init__(self, rows: list[list[str]], *, worksheet_id: int = 1) -> None:
+    def __init__(self, rows: list[list[Any]], *, worksheet_id: int = 1) -> None:
         self.rows = [list(row) for row in rows]
         self.id = worksheet_id
         self.spreadsheet_id = f"spreadsheet-{worksheet_id}"
         self.batch_updates: list[tuple[list[dict], str]] = []
-        self.updates: list[tuple[str, list[list[str]]]] = []
-        self.appended_rows: list[list[str]] = []
+        self.batch_clears: list[list[str]] = []
+        self.updates: list[tuple[str, list[list[Any]]]] = []
+        self.appended_rows: list[list[Any]] = []
         self.value_render_options: list[str | None] = []
 
-    def row_values(self, row_index: int) -> list[str]:
+    def row_values(self, row_index: int) -> list[Any]:
         if row_index <= 0 or row_index > len(self.rows):
             return []
         return list(self.rows[row_index - 1])
 
-    def get_all_values(self, **kwargs) -> list[list[str]]:
+    def get_all_values(self, **kwargs) -> list[list[Any]]:
         self.value_render_options.append(kwargs.get("value_render_option"))
         return [list(row) for row in self.rows]
 
-    def col_values(self, column_index: int) -> list[str]:
+    def col_values(self, column_index: int) -> list[Any]:
         return [row[column_index - 1] if len(row) >= column_index else "" for row in self.rows]
 
-    def update(self, range_name: str, values: list[list[str]], **_kwargs) -> None:
+    def update(self, range_name: str, values: list[list[Any]], **_kwargs) -> None:
         self.updates.append((range_name, [list(row) for row in values]))
         if range_name == "F1:G1":
             while len(self.rows[0]) < 7:
@@ -69,10 +71,21 @@ class FakeWorksheet:
                 self.rows[row_index].append("")
             self.rows[row_index][start_column : end_column + 1] = list(request["values"][0])
 
-    def append_row(self, row: list[str], **_kwargs) -> None:
+    def batch_clear(self, ranges: list[str]) -> None:
+        self.batch_clears.append(list(ranges))
+        for range_name in ranges:
+            start, end = range_name.split(":")
+            start_column = ord(start) - ord("A")
+            end_column = ord(end) - ord("A")
+            for row in self.rows:
+                for column in range(start_column, end_column + 1):
+                    if column < len(row):
+                        row[column] = ""
+
+    def append_row(self, row: list[Any], **_kwargs) -> None:
         self.appended_rows.append(list(row))
 
-    def append_rows(self, rows: list[list[str]], **_kwargs) -> None:
+    def append_rows(self, rows: list[list[Any]], **_kwargs) -> None:
         self.appended_rows.extend(list(row) for row in rows)
 
 
@@ -134,6 +147,15 @@ class GoogleSyncTests(unittest.TestCase):
         self.database_context.__exit__(None, None, None)
         self.temporary_directory.cleanup()
 
+    @staticmethod
+    def _complete_cutover() -> None:
+        cutover = local_repository.begin_sheet_import(
+            10,
+            "google-bootstrap-v1",
+            "manual-siphon-test-cutover",
+        )
+        local_repository.complete_sheet_import(cutover.import_id)
+
     def test_unformatted_numeric_zero_is_not_treated_as_a_blank_siphon(self) -> None:
         self.assertEqual(0, google_sync._parse_integer(0, allow_blank=True))
         self.assertEqual(12, google_sync._parse_integer(12.0, allow_blank=True))
@@ -190,6 +212,199 @@ class GoogleSyncTests(unittest.TestCase):
             self.assertIsNone(google_sync._sync_task)
 
         asyncio.run(scenario())
+
+    def test_background_worker_flushes_projection_without_importing_siphon(self) -> None:
+        async def scenario() -> None:
+            with (
+                patch.object(
+                    google_sync.document_store,
+                    "load_google_sheet_links",
+                    return_value={10: {"status": "active"}},
+                ),
+                patch.object(
+                    google_sync,
+                    "bootstrap_guild",
+                    new=AsyncMock(return_value=google_sync.SyncResult(True, "ready")),
+                ),
+                patch.object(
+                    google_sync,
+                    "flush_outbox",
+                    new=AsyncMock(return_value=google_sync.SyncResult(True, "done")),
+                ) as flush_outbox,
+                patch.object(
+                    google_sync,
+                    "sync_siphon_from_sheet",
+                    new=AsyncMock(),
+                ) as sync_siphon,
+                patch.object(
+                    google_sync.asyncio,
+                    "sleep",
+                    new=AsyncMock(side_effect=asyncio.CancelledError),
+                ),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await google_sync._sync_loop()
+
+            flush_outbox.assert_awaited_once_with(10)
+            sync_siphon.assert_not_awaited()
+
+        asyncio.run(scenario())
+
+    def test_immediate_player_projection_is_a_noop_without_a_google_link(self) -> None:
+        with (
+            patch.object(
+                google_sync.document_store,
+                "get_google_sheet_link",
+                return_value=None,
+            ),
+            patch.object(
+                google_sync,
+                "_project_linked_players_unlocked",
+            ) as project_players,
+        ):
+            result = google_sync.project_linked_players_sync(10, (20,))
+
+        self.assertIsNone(result)
+        project_players.assert_not_called()
+
+    def test_immediate_player_projection_bypasses_blocked_outbox_and_writes_numeric_silver(
+        self,
+    ) -> None:
+        local_repository.register_player(10, 20, "Player")
+        self._complete_cutover()
+        older_event = local_repository.claim_pending_outbox(
+            "blocked-worker",
+            guild_id=10,
+        )[0]
+        local_repository.fail_outbox(
+            older_event.event_id,
+            "temporary history failure",
+            retry_after_seconds=3600,
+            worker_id="blocked-worker",
+        )
+        local_repository.change_balance(10, 20, 3, idempotency_key="credit")
+        worksheet = FakeWorksheet(
+            [
+                [
+                    "Discord ID",
+                    "Albion Nickname",
+                    "Is In Guild",
+                    "Silver",
+                    "Siphon",
+                    "Custom",
+                ],
+                ["20", "Manual name", "NO", "'0", -9, "keep me"],
+            ]
+        )
+        with (
+            patch.object(
+                google_sync.document_store,
+                "get_google_sheet_link",
+                return_value={"status": "active"},
+            ),
+            patch.object(
+                google_sync.credential_store,
+                "get_credentials_info",
+                return_value=self.credentials,
+            ),
+            patch.object(
+                google_sync.google_sheets,
+                "get_worksheets",
+                return_value={"players": worksheet},
+            ),
+        ):
+            result = google_sync.project_linked_players_sync(10, (20,))
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result.success)
+        self.assertEqual(["20", "Player", "YES", 3, -9, "keep me"], worksheet.rows[1])
+        self.assertIsInstance(worksheet.rows[1][3], int)
+        self.assertTrue(local_repository.has_incomplete_outbox(guild_id=10))
+
+    def test_immediate_player_projection_writes_every_requested_lootsplit_player(
+        self,
+    ) -> None:
+        local_repository.register_player(10, 20, "First")
+        local_repository.register_player(10, 21, "Second")
+        self._complete_cutover()
+        lootsplit = local_repository.apply_lootsplit(
+            10,
+            ("First", "Second"),
+            7,
+            idempotency_key="lootsplit",
+        )
+        worksheet = FakeWorksheet(
+            [
+                ["Discord ID", "Albion Nickname", "Is In Guild", "Silver", "Siphon"],
+                ["20", "First", "YES", 0, -1],
+                ["21", "Second", "YES", 0, -2],
+            ]
+        )
+        with (
+            patch.object(
+                google_sync.document_store,
+                "get_google_sheet_link",
+                return_value={"status": "active"},
+            ),
+            patch.object(
+                google_sync.credential_store,
+                "get_credentials_info",
+                return_value=self.credentials,
+            ),
+            patch.object(
+                google_sync.google_sheets,
+                "get_worksheets",
+                return_value={"players": worksheet},
+            ),
+        ):
+            result = google_sync.project_linked_players_sync(
+                10,
+                tuple(credit.discord_user_id for credit in lootsplit.credits),
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result.success)
+        self.assertEqual(7, worksheet.rows[1][3])
+        self.assertEqual(7, worksheet.rows[2][3])
+        self.assertEqual(-1, worksheet.rows[1][4])
+        self.assertEqual(-2, worksheet.rows[2][4])
+
+    def test_immediate_player_projection_rejects_duplicate_discord_id_rows(self) -> None:
+        local_repository.register_player(10, 20, "Player")
+        self._complete_cutover()
+        worksheet = FakeWorksheet(
+            [
+                ["Discord ID", "Albion Nickname", "Is In Guild", "Silver", "Siphon"],
+                ["20", "Player", "YES", 0, -1],
+                ["20", "Duplicate", "YES", 0, -2],
+            ]
+        )
+        with (
+            patch.object(
+                google_sync.document_store,
+                "get_google_sheet_link",
+                return_value={"status": "active"},
+            ),
+            patch.object(
+                google_sync.credential_store,
+                "get_credentials_info",
+                return_value=self.credentials,
+            ),
+            patch.object(
+                google_sync.google_sheets,
+                "get_worksheets",
+                return_value={"players": worksheet},
+            ),
+        ):
+            result = google_sync.project_linked_players_sync(10, (20,))
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertFalse(result.success)
+        self.assertIn("duplicate Discord ID 20", result.message)
+        self.assertEqual([], worksheet.batch_updates)
 
     def test_bootstrap_imports_players_and_histories_once(self) -> None:
         players = FakeWorksheet(
@@ -248,8 +463,7 @@ class GoogleSyncTests(unittest.TestCase):
         assert player is not None
         self.assertEqual(500, player.silver)
         self.assertEqual(-10, player.siphon)
-        self.assertEqual("10:20", players.rows[1][5])
-        self.assertEqual(str(player.revision), players.rows[1][6])
+        self.assertEqual(["20", "Player", "YES", 500, "-10"], players.rows[1])
         with sqlite_database.connection() as database:
             self.assertEqual(
                 1,
@@ -262,7 +476,7 @@ class GoogleSyncTests(unittest.TestCase):
                 database.execute("SELECT COUNT(*) FROM imported_lootsplit_history").fetchone()[0],
             )
 
-    def test_projection_header_adoption_never_writes_siphon_column_e(self) -> None:
+    def test_projection_header_adoption_clears_only_owned_legacy_columns(self) -> None:
         worksheet = FakeWorksheet(
             [
                 [
@@ -271,16 +485,62 @@ class GoogleSyncTests(unittest.TestCase):
                     "Is In Guild",
                     "Silver",
                     "Siphon",
-                    "",
-                    "",
-                ]
+                    "Realm Registration ID",
+                    "Realm Revision",
+                    "Operator Notes",
+                ],
+                ["20", "Player", "YES", 3, -1, "10:20", "4", "keep"],
             ]
         )
 
         google_sync._ensure_players_projection_headers(worksheet)
 
         self.assertEqual("Siphon", worksheet.rows[0][4])
-        self.assertEqual(["F1:G1"], [update[0] for update in worksheet.updates])
+        self.assertEqual([["F:F", "G:G"]], worksheet.batch_clears)
+        self.assertEqual(["", "", "Operator Notes"], worksheet.rows[0][5:8])
+        self.assertEqual(["", "", "keep"], worksheet.rows[1][5:8])
+
+    def test_projection_header_adoption_preserves_repurposed_trailing_columns(self) -> None:
+        worksheet = FakeWorksheet(
+            [
+                [
+                    "Discord ID",
+                    "Albion Nickname",
+                    "Is In Guild",
+                    "Silver",
+                    "Siphon",
+                    "Custom F",
+                    "Custom G",
+                ]
+            ]
+        )
+
+        google_sync._ensure_players_projection_headers(worksheet)
+
+        self.assertEqual([], worksheet.batch_clears)
+        self.assertEqual("Custom F", worksheet.rows[0][5])
+        self.assertEqual("Custom G", worksheet.rows[0][6])
+
+    def test_player_projection_does_not_reuse_a_row_with_custom_trailing_data(self) -> None:
+        local_repository.register_player(10, 20, "Player")
+        worksheet = FakeWorksheet(
+            [
+                [
+                    "Discord ID",
+                    "Albion Nickname",
+                    "Is In Guild",
+                    "Silver",
+                    "Siphon",
+                    "Operator Notes",
+                ],
+                ["", "", "", "", "", "keep this row"],
+            ]
+        )
+
+        google_sync._reconcile_player_projection(worksheet, 10)
+
+        self.assertEqual(["", "", "", "", "", "keep this row"], worksheet.rows[1])
+        self.assertEqual("20", worksheet.rows[2][0])
 
     def test_linked_guild_identity_mismatch_fails_before_sheet_access(self) -> None:
         mismatched = dict(self.credentials, guild_name="Another Albion Guild")
@@ -438,17 +698,7 @@ class GoogleSyncTests(unittest.TestCase):
     def test_outbox_projects_player_and_is_acknowledged(self) -> None:
         local_repository.register_player(10, 20, "Player")
         players = FakeWorksheet(
-            [
-                [
-                    "Discord ID",
-                    "Albion Nickname",
-                    "Is In Guild",
-                    "Silver",
-                    "Siphon",
-                    "Realm Registration ID",
-                    "Realm Revision",
-                ]
-            ]
+            [["Discord ID", "Albion Nickname", "Is In Guild", "Silver", "Siphon"]]
         )
         with (
             patch.object(
@@ -467,29 +717,22 @@ class GoogleSyncTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(1, result.processed_events)
         self.assertEqual(1, len(players.batch_updates))
+        self.assertIsInstance(players.rows[1][3], int)
+        self.assertEqual(0, players.rows[1][3])
         self.assertEqual([], local_repository.list_pending_outbox(guild_id=10))
 
     def test_player_reconciliation_reads_sheet_rows_once_for_the_whole_batch(self) -> None:
         for discord_id in (20, 21, 22):
             local_repository.register_player(10, discord_id, f"Player {discord_id}")
         players = FakeWorksheet(
-            [
-                [
-                    "Discord ID",
-                    "Albion Nickname",
-                    "Is In Guild",
-                    "Silver",
-                    "Siphon",
-                    "Realm Registration ID",
-                    "Realm Revision",
-                ]
-            ]
+            [["Discord ID", "Albion Nickname", "Is In Guild", "Silver", "Siphon"]]
         )
 
         google_sync._reconcile_player_projection(players, 10)
 
         self.assertEqual([None], players.value_render_options)
-        self.assertEqual(3, len(players.batch_updates))
+        self.assertEqual(1, len(players.batch_updates))
+        self.assertEqual(3, len(players.batch_updates[0][0]))
 
     def test_projection_rebuild_repairs_managed_rows_without_acknowledging_outbox(
         self,
@@ -511,16 +754,8 @@ class GoogleSyncTests(unittest.TestCase):
         local_repository.complete_sheet_import(cutover.import_id)
         players = FakeWorksheet(
             [
-                [
-                    "Discord ID",
-                    "Albion Nickname",
-                    "Is In Guild",
-                    "Silver",
-                    "Siphon",
-                    "Realm Registration ID",
-                    "Realm Revision",
-                ],
-                ["20", "Stale", "NO", "0", "=ARRAYFORMULA(...)", "", ""],
+                ["Discord ID", "Albion Nickname", "Is In Guild", "Silver", "Siphon"],
+                ["20", "Stale", "NO", "0", "=ARRAYFORMULA(...)"],
             ]
         )
         worksheets = self._projection_worksheets(players)
@@ -548,10 +783,8 @@ class GoogleSyncTests(unittest.TestCase):
                 "20",
                 "Player",
                 "YES",
-                "25",
+                25,
                 "=ARRAYFORMULA(...)",
-                "10:20",
-                str(current.revision),
             ],
             players.rows[1],
         )
@@ -647,24 +880,21 @@ class GoogleSyncTests(unittest.TestCase):
         self.assertEqual([], balance.appended_rows)
         self.assertEqual([], lootsplit.appended_rows)
 
-    def test_siphon_pull_requires_matching_local_silver_and_revision(self) -> None:
+    def test_manual_siphon_sync_matches_discord_id_and_current_silver(self) -> None:
         local_repository.register_player(10, 20, "Player")
         local_repository.change_balance(10, 20, 500, idempotency_key="credit")
-        player = local_repository.get_player(10, 20)
-        assert player is not None
+        self._complete_cutover()
         headers = [
             "Discord ID",
             "Albion Nickname",
             "Is In Guild",
             "Silver",
             "Siphon",
-            "Realm Registration ID",
-            "Realm Revision",
         ]
         worksheet = FakeWorksheet(
             [
                 headers,
-                ["20", "Player", "YES", "499", "-20", "10:20", str(player.revision)],
+                [20.0, "Player", "YES", 499.0, -20.0],
             ]
         )
         with (
@@ -679,18 +909,19 @@ class GoogleSyncTests(unittest.TestCase):
                 return_value={"players": worksheet},
             ),
         ):
-            stale = google_sync.refresh_siphon_sync(10, flush_pending=False)
-            worksheet.rows[1][3] = "500"
-            fresh = google_sync.refresh_siphon_sync(10, flush_pending=False)
+            stale = google_sync.sync_siphon_from_sheet_sync(10)
+            worksheet.rows[1][3] = 500.0
+            fresh = google_sync.sync_siphon_from_sheet_sync(10)
 
         self.assertEqual(0, stale.updated_siphon_rows)
         self.assertEqual(1, fresh.updated_siphon_rows)
         self.assertEqual(-20, local_repository.get_player(10, 20).siphon)
         self.assertIn("UNFORMATTED_VALUE", worksheet.value_render_options)
 
-    def test_blank_revision_is_rejected_and_replaces_old_cached_siphon(self) -> None:
+    def test_duplicate_discord_id_is_rejected_and_replaces_old_cached_siphon(self) -> None:
         player = local_repository.register_player(10, 20, "Player").player
         assert player is not None
+        self._complete_cutover()
         local_repository.cache_siphon(
             10,
             20,
@@ -705,10 +936,9 @@ class GoogleSyncTests(unittest.TestCase):
                     "Is In Guild",
                     "Silver",
                     "Siphon",
-                    "Realm Registration ID",
-                    "Realm Revision",
                 ],
-                ["20", "Player", "YES", "0", "-11", "10:20", ""],
+                ["20", "Player", "YES", 0, -11],
+                ["20", "Duplicate", "YES", 0, -12],
             ]
         )
         with (
@@ -723,7 +953,7 @@ class GoogleSyncTests(unittest.TestCase):
                 return_value={"players": worksheet},
             ),
         ):
-            result = google_sync.refresh_siphon_sync(10, flush_pending=False)
+            result = google_sync.sync_siphon_from_sheet_sync(10)
 
         self.assertFalse(result.success)
         self.assertTrue(result.incomplete)
@@ -731,8 +961,43 @@ class GoogleSyncTests(unittest.TestCase):
         self.assertEqual(0, result.updated_siphon_rows)
         self.assertIsNone(local_repository.get_player(10, 20).siphon)
 
-    def test_delayed_head_event_blocks_siphon_refresh_and_newer_projection(self) -> None:
+    def test_blank_sheet_silver_is_not_accepted_as_zero_during_siphon_sync(self) -> None:
+        player = local_repository.register_player(10, 20, "Player").player
+        assert player is not None
+        self._complete_cutover()
+        local_repository.cache_siphon(
+            10,
+            20,
+            -9,
+            expected_revision=player.revision,
+        )
+        worksheet = FakeWorksheet(
+            [
+                ["Discord ID", "Albion Nickname", "Is In Guild", "Silver", "Siphon"],
+                ["20", "Player", "YES", "", -12],
+            ]
+        )
+        with (
+            patch.object(
+                google_sync.credential_store,
+                "get_credentials_info",
+                return_value=self.credentials,
+            ),
+            patch.object(
+                google_sync.google_sheets,
+                "get_worksheets",
+                return_value={"players": worksheet},
+            ),
+        ):
+            result = google_sync.sync_siphon_from_sheet_sync(10)
+
+        self.assertFalse(result.success)
+        self.assertEqual(0, result.updated_siphon_rows)
+        self.assertIsNone(local_repository.get_player(10, 20).siphon)
+
+    def test_manual_siphon_sync_does_not_flush_or_wait_for_the_projection_queue(self) -> None:
         local_repository.register_player(10, 20, "Player")
+        self._complete_cutover()
         head = local_repository.claim_pending_outbox("test", guild_id=10)[0]
         local_repository.fail_outbox(
             head.event_id,
@@ -741,16 +1006,51 @@ class GoogleSyncTests(unittest.TestCase):
             worker_id="test",
         )
         local_repository.change_balance(10, 20, 50, idempotency_key="newer")
-        with patch.object(
-            google_sync.credential_store,
-            "get_credentials_info",
-            return_value=self.credentials,
+        worksheet = FakeWorksheet(
+            [
+                ["Discord ID", "Albion Nickname", "Is In Guild", "Silver", "Siphon"],
+                ["20", "Player", "YES", 50, -7],
+            ]
+        )
+        with (
+            patch.object(
+                google_sync.credential_store,
+                "get_credentials_info",
+                return_value=self.credentials,
+            ),
+            patch.object(
+                google_sync.google_sheets,
+                "get_worksheets",
+                return_value={"players": worksheet},
+            ),
         ):
-            result = google_sync.refresh_siphon_sync(10, flush_pending=True)
+            result = google_sync.sync_siphon_from_sheet_sync(10)
+
+        self.assertTrue(result.success)
+        self.assertEqual(-7, local_repository.get_player(10, 20).siphon)
+        self.assertTrue(local_repository.has_incomplete_outbox(guild_id=10))
+
+    def test_manual_siphon_sync_returns_an_actionable_schema_failure(self) -> None:
+        local_repository.register_player(10, 20, "Player")
+        self._complete_cutover()
+        worksheet = FakeWorksheet([["Wrong", "Players", "Headers", "Here"]])
+        with (
+            patch.object(
+                google_sync.credential_store,
+                "get_credentials_info",
+                return_value=self.credentials,
+            ),
+            patch.object(
+                google_sync.google_sheets,
+                "get_worksheets",
+                return_value={"players": worksheet},
+            ),
+        ):
+            result = google_sync.sync_siphon_from_sheet_sync(10)
 
         self.assertFalse(result.success)
-        self.assertIn("earlier event", result.message)
-        self.assertTrue(local_repository.has_incomplete_outbox(guild_id=10))
+        self.assertTrue(result.incomplete)
+        self.assertIn("Players headers must start with", result.message)
 
     def test_relink_is_export_only_and_does_not_duplicate_legacy_history(self) -> None:
         first_players = FakeWorksheet(
@@ -886,17 +1186,7 @@ class GoogleSyncTests(unittest.TestCase):
         local_repository.register_player(10, 20, "Player")
         local_repository.change_balance(10, 20, 500, idempotency_key="credit")
         players = FakeWorksheet(
-            [
-                [
-                    "Discord ID",
-                    "Albion Nickname",
-                    "Is In Guild",
-                    "Silver",
-                    "Siphon",
-                    "Realm Registration ID",
-                    "Realm Revision",
-                ]
-            ]
+            [["Discord ID", "Albion Nickname", "Is In Guild", "Silver", "Siphon"]]
         )
         with (
             patch.object(
@@ -913,7 +1203,7 @@ class GoogleSyncTests(unittest.TestCase):
             result = google_sync.flush_outbox_sync(10, limit=1)
 
         self.assertFalse(result.success)
-        self.assertEqual("500", players.rows[1][3])
+        self.assertEqual(500, players.rows[1][3])
 
 
 if __name__ == "__main__":

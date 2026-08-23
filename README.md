@@ -42,9 +42,9 @@ python scripts/migrate_to_sqlite.py
 
 After cutover, SQLite is authoritative. Legacy JSON edits are ignored. Manual
 changes to projected Google player/history fields are overwritten by local data;
-only a Siphon value whose registration ID, Silver, and revision match SQLite is
-accepted locally. Restore the complete pre-upgrade backup before attempting to
-roll back to v1.
+only Siphon is imported on demand with `/sync-siphon`, using a unique Discord ID
+and current Silver check. Restore the complete pre-upgrade backup before
+attempting to roll back to v1.
 
 ## Local setup
 
@@ -162,12 +162,13 @@ Google synchronization, and transactional balance accounting.
 - `/sync-status`
 - `/sync-retry`
 - `/sync-rebuild`
+- `/sync-siphon`
 
 ## Permissions model
 
 - Admin-only:
 	- `/bot-setup`, `/bot-link-google-sheet`, `/tickets-setup`, `/role-reaction-setup`, `/set-objective-panel`, `/update-config`, `/bot-remove`, `/force-register`, `/clear`, `/add-utc-timer`, `/sync-status`, `/sync-retry`, `/sync-rebuild`
-- Economy operations (`/lootsplit`, `/get-negative-siphon`, `/bal-add`, `/bal-remove`):
+- Economy operations (`/lootsplit`, `/get-negative-siphon`, `/sync-siphon`, `/bal-add`, `/bal-remove`):
 	- Allowed for Admins OR members with configured Economy Manager role(s)
 - Comp officer actions (`!create-comp`, forced sign-up/sign-out in party threads):
 	- Allowed for Admins OR members with configured Caller role(s)
@@ -207,8 +208,8 @@ next startup resumes from that exact snapshot instead of mixing rows from two
 different Sheet revisions. Existing Sheet Silver becomes the starting local
 balance; imported history is audit-only and is not added to that balance. After
 cutover, SQLite always wins. Local changes are mirrored through a retryable
-outbox, only Siphon flows back, and later relinks seed players and immutable
-history from SQLite using stable event IDs.
+outbox, Siphon flows back only when `/sync-siphon` is run, and later relinks seed
+players and immutable history from SQLite using stable event IDs.
 
 Link fields:
 
@@ -231,14 +232,17 @@ business data:
 - `/sync-rebuild` reconstructs bot-owned player and history fields from SQLite.
   It is refused until the initial legacy cutover is complete and never overwrites
   the Sheet-owned Siphon column.
+- `/sync-siphon` is available to Admins and configured Economy Managers. It
+  explicitly replaces the current local Siphon cache from column E without
+  changing Silver or any other authoritative SQLite field.
 
 Your linked Google Sheet is required to have 3 worksheets with the **EXACT** naming you provided in `/bot-link-google-sheet`:
 
 - **Players** worksheet (values are examples):
 
-| Discord ID | Albion Nickname | Is In Guild | Silver | Siphon | Realm Registration ID | Realm Revision |
-|------------|-----------------|-------------|--------|--------|-----------------------|----------------|
-| 1234567890 | Nickname | YES | 0 | 0 | 987654321:1234567890 | 1 |
+| Discord ID | Albion Nickname | Is In Guild | Silver | Siphon |
+|------------|-----------------|-------------|--------|--------|
+| 1234567890 | Nickname | YES | 0 | 0 |
 
 - **Lootsplit History** worksheet:
 
@@ -252,12 +256,14 @@ Your linked Google Sheet is required to have 3 worksheets with the **EXACT** nam
 |------|--------|---------|----------|--------|----------------|
 | 03/24/26 17:44 UTC | Payout | Officer name | Player name | -2500000 | generated-id |
 
-Header matching is case-sensitive. The bot creates the local identity/revision and
-event-ID headers when they are blank. Keep the Siphon formula entirely in column
-E—prefer one `ARRAYFORMULA` managed by the Sheet—and never make A-D or F-G
-operator-editable. The bot accepts a calculated value only when the row's local
-ID, Silver, and revision exactly match SQLite. The background sync runs every
-five minutes; `/get-negative-siphon` first requests a fresh synchronized snapshot.
+Header matching is case-sensitive. The bot creates history event-ID headers when
+they are blank. Keep the Siphon formula entirely in column E—prefer one
+`ARRAYFORMULA` managed by the Sheet—and do not make A-D operator-editable. The
+bot locates each player by a unique Discord ID and accepts Siphon only when the
+Sheet Silver still matches SQLite. `/sync-siphon` performs this import manually;
+the background worker only delivers and retries local-to-Google projections.
+Legacy `Realm Registration ID` and `Realm Revision` columns are cleared when the
+bot recognizes their exact old headers; unrelated trailing columns are preserved.
 
 - You can make a copy of the following Google Sheet: https://docs.google.com/spreadsheets/d/1N9YYq0tNboJsG0n9fvTngG0JfXxO2zwaKAKMPEWjBuc
 
@@ -307,7 +313,7 @@ The bot runs a background audit every **3 minutes** to detect players who left t
   so stale API work cannot overwrite a newer registration or balance update.
 - A confirmed departure only changes `Is In Guild` to `NO`; nickname, Albion ID,
   Silver, all-time earnings, and histories remain stored in SQLite.
-- If Google is linked, the resulting local membership revision is projected later as `Is In Guild = NO`.
+- If Google is linked, the resulting local membership status is projected later as `Is In Guild = NO`.
 - After the local state change, the configured **Leave guild action** is applied:
 	- **Kick from server**
 	- **Remove all roles** (all non-managed roles the bot is allowed to remove)
@@ -535,7 +541,9 @@ Required permissions for notifications:
   invoking user's own balance. All variants share the same balance view and show
   the displayed player's current Silver leaderboard position in the footer.
 - Without Google, Silver remains available and Siphon is shown as unavailable.
-- A Siphon invalidated by a newer local revision is shown as pending/stale rather than reused.
+- A Siphon invalidated by a newer local change is shown as pending until an
+  Economy Manager or Admin runs `/sync-siphon`; elapsed time alone does not
+  invalidate an otherwise current value.
 
 ### `!lb`
 
@@ -554,7 +562,10 @@ Required permissions for notifications:
 	- Date, Reason, Officer, Nickname, Amount
 - Positive `/bal-add` credits also increase all-time earnings; `/bal-remove`
   never decreases all-time earnings.
-- Queue the player and history projection when Google is linked.
+- When Google is linked, immediately attempt to write the affected player's
+  current A-D fields, including committed Silver as a numeric cell. The full
+  player/history event stays queued for idempotent automatic delivery, and a
+  Google failure never rolls back SQLite.
 - Defaults:
 	- `/bal-add` reason: `Manual`
 	- `/bal-remove` reason: `Payout`
@@ -577,7 +588,9 @@ Behavior:
 - Credits all found participants, the lootsplit record, and immutable balance
   history in one SQLite transaction.
 - Commits every matched credit together and reports any missing participant names.
-- Queues idempotent Google history/player projections when a Sheet is linked.
+- When a Sheet is linked, immediately rewrites every credited Players row after
+  SQLite commits. Lootsplit and balance histories remain in the durable outbox
+  for idempotent delivery and retry.
 
 Google projection failures use retry-with-backoff and never change the completed local result.
 

@@ -115,9 +115,13 @@ Google Sheets is an optional projection and Siphon calculation engine; it is not
 Local-to-Google flow:
 
 1. A command commits authoritative SQLite state and an outbox event atomically.
-2. A per-guild FIFO worker writes current player state and appends history.
-3. Stable event IDs make retries idempotent.
-4. Failed or rate-limited events remain pending with backoff; local commands do not roll back.
+2. Balance and lootsplit commands directly rewrite the affected current Players
+   rows by Discord ID after the local commit. This best-effort fast path does not
+   consume or wait behind the outbox.
+3. The background worker delivers and retries the complete FIFO player/history
+   projection without importing Siphon.
+4. Stable event IDs make retries idempotent.
+5. Failed or rate-limited events remain pending with backoff; local commands do not roll back.
 
 After repeated failures an event moves to a dead-letter table instead of
 blocking newer operations forever. `/sync-status`, `/sync-retry`, and
@@ -125,9 +129,22 @@ blocking newer operations forever. `/sync-status`, `/sync-retry`, and
 applied import snapshots are pruned after 30 days; immutable economy histories,
 registrations, dead letters, and migration evidence remain retained.
 
-The Players projection uses columns A-D for Discord ID, nickname, membership, and Silver; E remains the Sheet-calculated Siphon; F-G contain the internal ledger registration ID and revision. History worksheets receive an additional `Realm Event ID` column. A newly linked physical Sheet is seeded from SQLite, including immutable histories with stable event IDs. It is never treated as an import source again after that ledger generation's first completed legacy cutover.
+The Players projection uses columns A-D for Discord ID, nickname, membership,
+and numeric Silver; E remains the Sheet-calculated Siphon. Rows are located by
+unique Discord ID. Older bot-owned registration-ID/revision columns are cleared
+in place when their exact legacy headers are found, without shifting or touching
+repurposed trailing columns. History worksheets receive an additional
+`Realm Event ID` column. A newly linked physical Sheet is seeded from SQLite,
+including immutable histories with stable event IDs. It is never treated as an
+import source again after that ledger generation's first completed legacy cutover.
 
-Google-to-local flow is restricted to Siphon. Before a pull, the worker fully drains older local changes. It accepts a Siphon only when the Sheet's local registration ID, Silver, and revision exactly match the current SQLite player. Any balance or membership revision invalidates the old Siphon immediately. Missing, invalid, or stale rows are not reported as current values.
+Google-to-local flow is restricted to the explicit `/sync-siphon` command; the
+background worker never imports it. A row must have one unique Discord ID, active
+membership, current Silver, and an integer Siphon. The command binds accepted
+values to the player's current internal SQLite revision in one transaction, so
+a concurrent or later balance/membership change invalidates the cached Siphon
+without exposing revision metadata in Google. Missing, duplicated, invalid, or
+Silver-mismatched rows have their older cached values cleared.
 
 ## Security and consistency rules
 

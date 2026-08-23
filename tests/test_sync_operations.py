@@ -128,6 +128,57 @@ class SyncOperationsTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SyncCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sync_siphon_uses_economy_access_and_reports_ephemerally(self) -> None:
+        class FakeMember:
+            id = 9
+
+        result = google_sync.SyncResult(
+            True,
+            "Siphon synchronized from Google Sheets.",
+            updated_siphon_rows=3,
+            expected_siphon_rows=3,
+        )
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=7),
+            user=FakeMember(),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        command = next(
+            item
+            for item in sync_commands.create_sync_commands(SimpleNamespace())
+            if item.name == "sync-siphon"
+        )
+        with (
+            patch.object(sync_commands.discord, "Member", FakeMember),
+            patch.object(
+                sync_commands.economy_access,
+                "has_economy_access",
+                new=AsyncMock(return_value=True),
+            ) as has_access,
+            patch.object(
+                sync_commands.google_sync,
+                "sync_siphon_from_sheet",
+                new=AsyncMock(return_value=result),
+            ) as sync_siphon,
+            patch.object(
+                sync_commands._SIPHON_SYNC_COOLDOWN,
+                "claim",
+                return_value=0,
+            ),
+        ):
+            await command.callback(interaction)
+
+        has_access.assert_awaited_once_with(interaction.user, 7)
+        sync_siphon.assert_awaited_once_with(7)
+        interaction.response.defer.assert_awaited_once_with(
+            ephemeral=True,
+            thinking=True,
+        )
+        interaction.followup.send.assert_awaited_once()
+        self.assertTrue(interaction.followup.send.await_args.kwargs["ephemeral"])
+        self.assertIn("3/3", interaction.followup.send.await_args.args[0])
+
     async def test_status_is_admin_only_and_ephemeral(self) -> None:
         class FakeMember:
             id = 9
