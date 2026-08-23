@@ -1,5 +1,6 @@
 .env
 .venv/
+.venv-*/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -23,6 +24,7 @@ htmlcov/
 
 # Logs
 *.log
+*.log.*
 discord.log
 
 # Editor directories and files
@@ -46,3 +48,4 @@ google_sheet_credentials/
 
 # Local bot data
 configs/
+data/

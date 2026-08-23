@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install patched packaging tooling
+        run: python -m pip install --upgrade pip==26.2.1
+      - name: Install hash-locked runtime dependencies
+        if: matrix.python-version == '3.14'
+        run: python -m pip install --require-hashes -r requirements.lock
+      - name: Install runtime dependencies for compatibility test
+        if: matrix.python-version != '3.14'
+        run: python -m pip install -r requirements.txt
+      - name: Install development dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Build and install project package
+        run: python -m pip install --no-deps .
+      - name: Verify installed package imports independently
+        run: python -I -c "import src.realm_protector"
+      - name: Static lint
+        run: ruff check .
+      - name: Formatting check
+        run: ruff format --check .
+      - name: Type check
+        run: mypy src main.py scripts
+      - name: Tests
+        env:
+          REALM_PROTECTOR_DATABASE_PATH: ${{ runner.temp }}/realm-protector-tests.sqlite3
+        run: coverage run -m unittest discover -s tests -v
+      - name: Coverage report
+        run: coverage report
+      - name: Dependency audit
+        run: pip-audit --strict

@@ -1,5 +1,6 @@
-discord.py
-python-dotenv
-gspread
-google-auth
-emoji
+discord.py==2.7.1
+emoji==2.15.0
+google-auth==2.56.2
+gspread==6.2.1
+python-dotenv==1.2.2
+requests==2.34.2
