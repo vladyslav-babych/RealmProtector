@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "realm-protector"
+version = "2.0.0"
+description = "Local-first Discord operations bot for Albion Online guilds"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "discord.py==2.7.1",
+    "emoji==2.15.0",
+    "google-auth==2.56.2",
+    "gspread==6.2.1",
+    "python-dotenv==1.2.2",
+    "requests==2.34.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src", "src.*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [".venv", "data", "google_sheet_credentials"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "ASYNC", "RUF"]
+ignore = [
+    "E501", # Formatting is enforced separately; Discord copy often exceeds 100 chars.
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B017"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+exclude = "(^|/)(\\.venv|data|google_sheet_credentials)/"
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]

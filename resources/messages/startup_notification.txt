@@ -1,0 +1,11 @@
+Bot has been restarted
+# v.2.0.0 release:
+
+- SQLite is now the local source of truth, and existing data is migrated automatically.
+- Panels, tickets, party threads, and active actions now recover after bot restarts.
+- Google Sheets is optional except for Siphon calculation.
+- Registration and tickets now let users choose from the first three Albion matches.
+- Balance panels now include all-time earnings and leaderboard position; use `!lb` for the full leaderboard.
+- Party sign-ups, membership checks, security, and overall reliability have been improved.
+
+@everyone

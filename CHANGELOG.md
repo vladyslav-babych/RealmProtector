@@ -6,7 +6,161 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ## [Unreleased]
 
-- (add upcoming changes here)
+## [v2.0.0] - 2026-08-23
+
+Realm Protector 2.0.0 is a major local-first reliability release. SQLite is now
+the authoritative source for bot data, stateful Discord workflows recover after
+restarts, and registration, tickets, party composition, and economy workflows
+have been expanded and hardened.
+
+### Upgrade notes
+
+- **Breaking:** Python 3.12, 3.13, or 3.14 is required. Recreate virtual
+  environments made with Python 3.9 or another unsupported interpreter.
+- Stop the v1 bot before upgrading and back up `.env`, `configs/`,
+  `google_sheet_credentials/`, the linked Google Sheets, and any existing
+  `data/realm_protector.sqlite3` database.
+- The first v2 startup creates/upgrades SQLite and imports legacy JSON
+  automatically. `python scripts/migrate_to_sqlite.py` performs the same
+  idempotent migration explicitly and returns a machine-readable report.
+- A linked Google Sheet is imported once from an immutable snapshot. Ledger
+  mutations remain temporarily gated until that cutover succeeds. Afterward,
+  SQLite wins: manual edits to projected player/history fields are overwritten,
+  and only revision-matched Siphon calculations flow back into local storage.
+- Legacy JSON inputs are retained as untouched backups but are ignored after a
+  successful import. Restore the complete pre-upgrade backup before attempting
+  a v1 rollback.
+
+### Added
+
+- Added authoritative SQLite persistence for guild configuration, ledger
+  generations, registrations, membership, Silver, all-time earnings, histories,
+  panels, objectives, tickets, compositions, timers, and active runtime actions.
+- Added automatic, fingerprinted legacy JSON migration and immutable Google
+  Sheet cutover, plus the standalone `scripts/migrate_to_sqlite.py` migration
+  and reporting command. Invalid or conflicting source rows are quarantined.
+- Added durable Discord reconciliation for panels, open tickets, ticket
+  close/archive work, party threads, reaction roles, objectives, notifications,
+  configuration removal, and failed Member-role assignment. Persistent views
+  and schedulers are restored after restart.
+- Added a durable Google projection outbox, dead-letter recovery, revision-safe
+  Siphon caching, full rebuild/retry support, and bounded 30-day cleanup of
+  completed delivery and snapshot records.
+- Added admin-only `/sync-status`, `/sync-retry`, and `/sync-rebuild` commands for
+  inspecting and repairing the optional Google projection.
+- Added ledger generations. `/bot-remove` archives the active ledger without
+  deleting its data, and a later setup receives a new empty generation.
+- Added admin-only `/force-register @User`. It reverifies the stored Albion
+  identity, reactivates only a confirmed guild member, and preserves all economy
+  and history data while attempting Discord nickname and Member-role repair.
+- Added cumulative all-time earnings. Manual positive credits and lootsplit
+  payouts increase it atomically; deductions never reduce it. Positive legacy
+  Balance History is backfilled once without replaying duplicate lootsplit rows.
+- Added the argument-free `!bal` command and the paginated `!lb` Silver
+  leaderboard with deterministic numbering, 10 entries per page, restart-safe
+  Previous/Next controls, and a page counter. `!bal`, `/bal`, and `/bal @User`
+  share one balance panel and show the displayed player's leaderboard position.
+- Added three-result Albion character pickers to tickets and `/register`, with
+  full character summaries and `1`/`2`/`3`/`Cancel` controls. Registration
+  selection is visible only to its invoker while the final result remains public.
+- Added a case-insensitive server-wide `housri` whole-word GIF response that
+  ignores DMs, bots, and webhooks.
+- Added Python 3.12-3.14 CI for package installation, Ruff, mypy, coverage,
+  offline tests, hash-locked dependencies, and vulnerability auditing. Added an
+  early unsupported-interpreter guard, architecture documentation, and extensive
+  regression coverage.
+
+### Changed
+
+- Made Google Sheets optional except for Siphon calculation. Local commits are
+  authoritative and project asynchronously; later manual edits to mirrored
+  fields never overwrite SQLite.
+- Reorganized the bot under `src/realm_protector/` into Discord presentation,
+  domain, application-service, and infrastructure layers. All 16 existing v1
+  slash commands were retained, with `/force-register` and three `/sync-*`
+  commands added in this release.
+- Made `main.py` import-safe, added explicit production/test token selection,
+  pinned runtime dependencies, moved runtime messages and media under
+  `resources/`, and hardened graceful shutdown of background workers.
+- Made `resources/messages/startup_notification.txt` the configurable source for
+  restart notifications.
+- Hardened membership departure checks with a 10-minute recent-registration
+  grace period, three consecutive non-membership confirmations, and a final
+  local revision check. Confirmed departures retain the full player record,
+  change only membership to `NO`, and then apply the configured leave action.
+- Allowed self-assignable Member and reaction roles to include Discord's
+  **Mention Everyone** and **Set Voice Channel Status** permissions. Removed the
+  privileged/self-assignable role-overlap restriction while retaining managed
+  role, hierarchy, and all other fail-closed permission checks.
+- Changed balance panels to show Balance and Siphon side by side, followed by
+  full-width All-time earnings and Raw balance rows.
+- Made edited party compositions highlight all assigned users while denying
+  role, `@everyone`, and reply-author pings.
+- Registration now attempts a failed Discord nickname update only during the
+  command; nickname failures are not persisted for restart/runtime retry. Failed
+  configured Member-role assignments remain recoverable.
+- Moved blocking Albion and Google work to bounded executors, configured explicit
+  Google timeouts, added API-heavy command cooldowns, and serialized lifecycle and
+  mutation paths so stale work cannot outlive setup replacement or removal.
+- Reduced UTC server-name refreshes to five-minute intervals while preserving
+  the displayed `HH:MM` format.
+
+### Removed
+
+- Removed legacy JSON and direct Google worksheet access as runtime sources of
+  truth. Successful legacy files remain available only as migration backups.
+- Removed ticket sequence numbers from channel names, metadata, embeds, and
+  configuration. Ticket identity and display now use the selected Albion
+  character nickname.
+- Removed visible internal recovery IDs and checkpoint text from completed
+  configuration, ticket, archive, reaction-role, composition, and objective
+  artifacts. Crash recovery uses SQLite IDs and short-lived non-rendered tokens.
+- Removed the `.env` restart-message override and obsolete JSON, worksheet,
+  timer-channel, and compatibility APIs.
+
+### Fixed
+
+- Fixed CI dependency auditing to scan the hash-locked third-party runtime set
+  instead of treating the unpublished local application package as a PyPI
+  dependency.
+- Fixed party-thread auto signup by resolving Discord's thread-starter wrapper
+  back to the editable parent message. Self and caller-forced signups now enforce
+  one role per member in each party and normalize both Discord mention formats.
+- Fixed exact Albion nickname selection, stable-ID registration verification,
+  delayed guild-membership propagation, and false departure processing after a
+  successful registration.
+- Fixed balance-history clamping, duplicate lootsplit participants, all-time
+  earnings backfill, and stale Siphon acceptance.
+- Fixed malformed or mismatched worksheet schemas, interrupted initial Sheet
+  imports, duplicate projection delivery, and linked-Sheet guild mismatches.
+- Fixed role-ID authorization and automatic role assignment while continuing to
+  reject Discord-managed or otherwise unsafe roles.
+- Fixed ticket open/close races, duplicate tickets, archive resumption, transcript
+  checkpoint leakage, and cleanup of legacy ticket markers.
+- Fixed objective role ownership, notification cleanup, retry behavior, and
+  reconciliation of stale objective artifacts.
+- Prevented stale membership audits from applying leave actions after teardown,
+  stale Google-link wizards from recreating removed secrets, and public ticket
+  character lookups from running when an open ticket already exists.
+- Prevented an in-flight UTC scheduler tick from restoring the timer suffix after
+  `/bot-remove`; enabling the timer now requires an active main setup.
+- Serialized configuration-panel refreshes with setup/removal so a concurrent
+  `/bot-remove` cannot leave behind a newly posted orphan panel.
+- Objective notification roles are tracked by Discord role ID plus local
+  ownership metadata. Verified legacy hash-suffixed roles are renamed cleanly;
+  renamed, elevated, shared, or otherwise repurposed roles are detached and left
+  untouched instead of being assigned or deleted.
+
+### Security
+
+- Confined service-account files to the credentials directory, isolated new
+  files by Discord guild ID, rejected traversal and symlink escapes, used atomic
+  owner-only writes, rolled credential files back when link metadata fails, and
+  hardened existing local secret/configuration modes.
+- Added bounds for battle IDs, monetary inputs, content names, and balance
+  reasons; restricted ticket archives and validated role hierarchy/permissions.
+- Denied Discord mentions by default and allowlisted only exact intended user
+  IDs, including messages containing officer- or member-supplied text.
 
 ## [v1.1.5] - 2026-04-09
 
@@ -132,13 +286,14 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 - Service account credentials and server configuration are stored as local JSON files on the machine hosting the bot. Treat the host as sensitive.
 
-[Unreleased]: compare/v1.1.5...HEAD
-[v1.1.5]: releases/tag/v1.1.5
-[v1.1.4]: releases/tag/v1.1.4
-[v1.1.3]: releases/tag/v1.1.3
-[v1.1.2]: releases/tag/v1.1.2
-[v1.1.1]: releases/tag/v1.1.1
-[v1.1.0]: releases/tag/v1.1.0
-[v1.0.1]: releases/tag/v1.0.1
-[v1.0.0]: releases/tag/v1.0.0
-[v0.1.0]: releases/tag/v0.1.0
+[Unreleased]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/compare/v2.0.0...HEAD
+[v2.0.0]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/compare/v1.1.5...v2.0.0
+[v1.1.5]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/releases/tag/v1.1.5
+[v1.1.4]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/releases/tag/v1.1.4
+[v1.1.3]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/releases/tag/v1.1.3
+[v1.1.2]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/releases/tag/v1.1.2
+[v1.1.1]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/releases/tag/v1.1.1
+[v1.1.0]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/releases/tag/v1.1.0
+[v1.0.1]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/releases/tag/v1.0.1
+[v1.0.0]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/releases/tag/v1.0.0
+[v0.1.0]: https://github.com/vladyslav-babych/albion-online-sign-up-bot/releases/tag/v0.1.0
