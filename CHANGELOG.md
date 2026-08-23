@@ -6,6 +6,34 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ## [Unreleased]
 
+## [v2.0.1] - 2026-08-23
+
+### Added
+
+- Added `/sync-siphon` for Admins and configured Economy Managers to explicitly
+  import the current Google Sheet Siphon snapshot into SQLite.
+
+### Changed
+
+- Manual balance changes and lootsplits now rewrite every affected Players row
+  immediately after the authoritative SQLite commit. This direct path cannot be
+  blocked by older history events; the durable outbox still retries the full
+  player and history projection.
+- Siphon is no longer pulled by the background worker or
+  `/get-negative-siphon`. Cached values remain current until a local player
+  revision invalidates them or `/sync-siphon` replaces the snapshot.
+
+### Removed
+
+- Removed `Realm Registration ID` and `Realm Revision` from the Players Sheet
+  schema. Existing bot-owned F/G values are cleared safely while custom trailing
+  columns are preserved.
+
+### Fixed
+
+- Fixed projected Silver being stored as apostrophe-prefixed text by sending a
+  numeric cell value while preserving Discord IDs as precision-safe text.
+
 ## [v2.0.0] - 2026-08-23
 
 Realm Protector 2.0.0 is a major local-first reliability release. SQLite is now

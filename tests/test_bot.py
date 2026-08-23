@@ -23,6 +23,7 @@ EXPECTED_SLASH_COMMANDS = {
     "set-objective-panel",
     "sync-rebuild",
     "sync-retry",
+    "sync-siphon",
     "sync-status",
     "tickets-setup",
     "update-config",
@@ -53,6 +54,7 @@ EXPECTED_PARAMETERS = {
     "set-objective-panel": [],
     "sync-rebuild": [],
     "sync-retry": [],
+    "sync-siphon": [],
     "sync-status": [],
     "tickets-setup": [],
     "update-config": [],
@@ -122,7 +124,7 @@ class BotCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
                     EXPECTED_SLASH_COMMANDS,
                     {command.name for command in bot.tree.get_commands()},
                 )
-                self.assertEqual(20, len(bot.tree.get_commands()))
+                self.assertEqual(21, len(bot.tree.get_commands()))
                 self.assertEqual(
                     EXPECTED_PARAMETERS,
                     {

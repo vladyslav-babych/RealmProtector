@@ -2,7 +2,8 @@
 
 SQLite owns registrations, membership state, Silver, and audit history.  Google
 Sheets is an optional projection of those fields and the calculation engine for
-Siphon.  The only routine Google-to-local flow after bootstrap is Siphon.
+Siphon. After bootstrap, Google-to-local Siphon flow occurs only through the
+explicit synchronization command.
 """
 
 from __future__ import annotations
@@ -31,14 +32,15 @@ from src.realm_protector.infrastructure import (
 
 LOGGER = logging.getLogger(__name__)
 SYNC_INTERVAL_SECONDS = 300
-SIPHON_STALE_AFTER_SECONDS = 15 * 60
 MAX_OUTBOX_ATTEMPTS = 8
 _PLAYERS_PROJECTION_HEADERS = [
     *google_sheets.PLAYERS_REQUIRED_HEADERS,
     "Siphon",
-    "Realm Registration ID",
-    "Realm Revision",
 ]
+_LEGACY_PLAYER_METADATA_HEADERS = {
+    5: "Realm Registration ID",
+    6: "Realm Revision",
+}
 _BALANCE_EVENT_HEADER = "Realm Event ID"
 _LOOTSPLIT_EVENT_HEADER = "Realm Event ID"
 _sync_task: Optional[asyncio.Task] = None
@@ -47,7 +49,7 @@ _SYNC_LOCKS: WeakValueDictionary[int, Any] = WeakValueDictionary()
 
 
 def _sync_lock(guild_id: int) -> threading.RLock:
-    """Serialize every Google workflow for one guild, including slash refreshes."""
+    """Serialize every Google workflow for one guild, including manual syncs."""
 
     with _SYNC_LOCKS_GUARD:
         return _SYNC_LOCKS.setdefault(int(guild_id), threading.RLock())
@@ -147,6 +149,12 @@ def _parse_integer(value: Any, *, allow_blank: bool = False) -> Optional[int]:
 
 def _cell(row: Sequence[Any], index: int) -> str:
     return str(row[index] if len(row) > index else "").strip()
+
+
+def _raw_cell(row: Sequence[Any], index: int) -> Any:
+    """Return a cell without discarding an unformatted Google numeric type."""
+
+    return row[index] if len(row) > index else None
 
 
 def _configured_sheet_identity(
@@ -590,7 +598,7 @@ def _bootstrap_guild_sync_unlocked(guild_id: int) -> SyncResult:
             lootsplit_worksheet,
             balance_worksheet,
         )
-        google_sheets.validate_players_headers(players_worksheet)
+        _ensure_players_projection_headers(players_worksheet)
         google_sheets.ensure_lootsplit_history_headers(lootsplit_worksheet)
         google_sheets.ensure_balance_history_headers(balance_worksheet)
 
@@ -641,8 +649,8 @@ def _bootstrap_guild_sync_unlocked(guild_id: int) -> SyncResult:
                 staged_snapshot,
             )
 
-        # Adopt every newly linked physical Sheet once: stamp all authoritative
-        # local players with stable IDs/revisions and prepare idempotency columns.
+        # Adopt every newly linked physical Sheet once: seed authoritative local
+        # players and prepare idempotency columns for immutable history rows.
         projection_import = local_repository.begin_sheet_import(
             ledger_id,
             "google-projection-v1",
@@ -755,14 +763,15 @@ def _ensure_players_projection_headers(worksheet) -> None:
             raise google_sheets.WorksheetSchemaError(
                 f"Players column {index + 1} must be {expected}."
             )
-    if padded[5:7] != _PLAYERS_PROJECTION_HEADERS[5:7]:
-        # E1 may contain the Sheet-owned array formula that emits the Siphon
-        # heading and values. It is never part of a bot-authored update.
-        worksheet.update(
-            range_name="F1:G1",
-            values=[_PLAYERS_PROJECTION_HEADERS[5:]],
-            value_input_option="RAW",
-        )
+    legacy_ranges = [
+        f"{chr(ord('A') + index)}:{chr(ord('A') + index)}"
+        for index, header in _LEGACY_PLAYER_METADATA_HEADERS.items()
+        if _cell(existing, index) == header
+    ]
+    if legacy_ranges:
+        # Older releases owned F:G. Clear only columns whose headers still prove
+        # that ownership; never shift columns or erase operator-defined fields.
+        worksheet.batch_clear(legacy_ranges)
 
 
 def _ensure_event_header(worksheet, base_headers: Sequence[str], event_header: str) -> None:
@@ -787,102 +796,120 @@ class _PlayerProjectionRows:
 
     def __init__(self, rows: list[list[Any]]) -> None:
         self.rows = rows
-        self.by_registration_id: dict[str, int] = {}
-        self.by_discord_id: dict[str, int] = {}
+        self.by_discord_id: dict[str, list[int]] = {}
         self.empty_rows: deque[int] = deque()
         self.owner_by_row: dict[int, str] = {}
         for row_index, row in enumerate(rows[1:], start=2):
-            registration_id = _cell(row, 5)
             discord_id = _cell(row, 0)
-            if registration_id:
-                self.by_registration_id.setdefault(registration_id, row_index)
             if discord_id:
-                self.by_discord_id.setdefault(discord_id, row_index)
-            if not any(_cell(row, index) for index in range(min(7, len(row)))):
+                self.by_discord_id.setdefault(discord_id, []).append(row_index)
+            # Ignore only the Sheet-owned Siphon formula/result in E. A row with
+            # custom trailing data must not be silently repurposed for a player.
+            if not any(_cell(row, index) for index in range(len(row)) if index != 4):
                 self.empty_rows.append(row_index)
 
-    def resolve(self, player: Mapping[str, Any]) -> int:
-        registration_id = f"{player['guild_id']}:{player['discord_user_id']}"
-        discord_id = str(player["discord_user_id"])
-        for row_index in (
-            self.by_registration_id.get(registration_id),
-            self.by_discord_id.get(discord_id),
-        ):
-            if row_index is None:
-                continue
+    def resolve(
+        self,
+        player: local_repository.PlayerRecord,
+        *,
+        repair_duplicates: bool = False,
+    ) -> int:
+        discord_id = str(player.discord_user_id)
+        matching_rows = self.by_discord_id.get(discord_id, [])
+        if len(matching_rows) > 1 and not repair_duplicates:
+            raise google_sheets.WorksheetSchemaError(
+                f"Players contains duplicate Discord ID {discord_id}."
+            )
+        for row_index in matching_rows:
             owner = self.owner_by_row.get(row_index)
-            if owner is None or owner == registration_id:
-                self.owner_by_row[row_index] = registration_id
+            if owner is None or owner == discord_id:
+                self.owner_by_row[row_index] = discord_id
                 return row_index
         while self.empty_rows:
             row_index = self.empty_rows.popleft()
             if row_index not in self.owner_by_row:
-                self.owner_by_row[row_index] = registration_id
+                self.owner_by_row[row_index] = discord_id
                 return row_index
         row_index = max(2, len(self.rows) + 1)
-        self.owner_by_row[row_index] = registration_id
+        while row_index in self.owner_by_row:
+            row_index += 1
+        self.owner_by_row[row_index] = discord_id
         return row_index
 
-    def record(self, row_index: int, player: Mapping[str, Any]) -> None:
-        registration_id = f"{player['guild_id']}:{player['discord_user_id']}"
-        discord_id = str(player["discord_user_id"])
+    def record(self, row_index: int, player: local_repository.PlayerRecord) -> None:
+        discord_id = str(player.discord_user_id)
         while len(self.rows) < row_index:
             self.rows.append([])
         cached = list(self.rows[row_index - 1])
-        old_registration_id = _cell(cached, 5)
         old_discord_id = _cell(cached, 0)
-        if self.by_registration_id.get(old_registration_id) == row_index:
-            self.by_registration_id.pop(old_registration_id, None)
-        if self.by_discord_id.get(old_discord_id) == row_index:
-            self.by_discord_id.pop(old_discord_id, None)
-        cached.extend([""] * max(0, 7 - len(cached)))
+        old_indices = self.by_discord_id.get(old_discord_id, [])
+        if row_index in old_indices:
+            old_indices.remove(row_index)
+            if not old_indices:
+                self.by_discord_id.pop(old_discord_id, None)
+        cached.extend([""] * max(0, 5 - len(cached)))
         cached[0:4] = [
             discord_id,
-            str(player["nickname"]),
-            "YES" if bool(player["is_in_guild"]) else "NO",
-            str(player["silver"]),
+            player.nickname,
+            "YES" if player.is_active else "NO",
+            player.silver,
         ]
-        cached[5:7] = [registration_id, str(player["revision"])]
         self.rows[row_index - 1] = cached
-        self.by_registration_id[registration_id] = row_index
-        self.by_discord_id[discord_id] = row_index
-        self.owner_by_row[row_index] = registration_id
+        self.by_discord_id.setdefault(discord_id, []).append(row_index)
+        self.owner_by_row[row_index] = discord_id
 
 
 def _project_player(
     worksheet,
-    player: Mapping[str, Any],
+    player: local_repository.PlayerRecord,
     *,
     row_cache: Optional[_PlayerProjectionRows] = None,
     ensure_headers: bool = True,
+    repair_duplicates: bool = False,
 ) -> None:
+    _project_players(
+        worksheet,
+        (player,),
+        row_cache=row_cache,
+        ensure_headers=ensure_headers,
+        repair_duplicates=repair_duplicates,
+    )
+
+
+def _project_players(
+    worksheet: Any,
+    players: Sequence[local_repository.PlayerRecord],
+    *,
+    row_cache: Optional[_PlayerProjectionRows] = None,
+    ensure_headers: bool = True,
+    repair_duplicates: bool = False,
+) -> None:
+    """Write several current player snapshots in one Google batch request."""
+
+    if not players:
+        return
     if ensure_headers:
         _ensure_players_projection_headers(worksheet)
     if row_cache is None:
-        row_cache = _PlayerProjectionRows(worksheet.get_all_values())
-    row_index = row_cache.resolve(player)
-    local_id = f"{player['guild_id']}:{player['discord_user_id']}"
-    worksheet.batch_update(
-        [
+        row_cache = _PlayerProjectionRows(_get_all_values(worksheet))
+    requests: list[dict[str, Any]] = []
+    for player in players:
+        row_index = row_cache.resolve(player, repair_duplicates=repair_duplicates)
+        requests.append(
             {
                 "range": f"A{row_index}:D{row_index}",
                 "values": [
                     [
-                        str(player["discord_user_id"]),
-                        str(player["nickname"]),
-                        "YES" if bool(player["is_in_guild"]) else "NO",
-                        str(player["silver"]),
+                        str(player.discord_user_id),
+                        player.nickname,
+                        "YES" if player.is_active else "NO",
+                        player.silver,
                     ]
                 ],
-            },
-            {
-                "range": f"F{row_index}:G{row_index}",
-                "values": [[local_id, str(player["revision"])]],
-            },
-        ],
-        value_input_option="RAW",
-    )
-    row_cache.record(row_index, player)
+            }
+        )
+        row_cache.record(row_index, player)
+    worksheet.batch_update(requests, value_input_option="RAW")
 
 
 def _reconcile_player_projection(worksheet: Any, guild_id: int) -> None:
@@ -892,20 +919,13 @@ def _reconcile_player_projection(worksheet: Any, guild_id: int) -> None:
     _ensure_players_projection_headers(worksheet)
     rows = _get_all_values(worksheet)
     row_cache = _PlayerProjectionRows(rows)
-    for player in players:
-        _project_player(
-            worksheet,
-            {
-                "guild_id": player.guild_id,
-                "discord_user_id": player.discord_user_id,
-                "nickname": player.nickname,
-                "is_in_guild": player.is_active,
-                "silver": player.silver,
-                "revision": player.revision,
-            },
-            row_cache=row_cache,
-            ensure_headers=False,
-        )
+    _project_players(
+        worksheet,
+        players,
+        row_cache=row_cache,
+        ensure_headers=False,
+        repair_duplicates=True,
+    )
 
     local_ids = {player.discord_user_id for player in players}
     seen_local_ids: set[int] = set()
@@ -916,31 +936,21 @@ def _reconcile_player_projection(worksheet: Any, guild_id: int) -> None:
     for row_index, row in enumerate(row_cache.rows[1:], start=2):
         raw_discord_id = _cell(row, 0)
         discord_user_id = int(raw_discord_id) if raw_discord_id.isdigit() else None
-        expected_registration_id = (
-            f"{guild_id}:{discord_user_id}" if discord_user_id is not None else ""
-        )
         is_authoritative = (
             discord_user_id is not None
             and discord_user_id in local_ids
             and discord_user_id not in seen_local_ids
-            and _cell(row, 5) == expected_registration_id
         )
         if is_authoritative and discord_user_id is not None:
             seen_local_ids.add(discord_user_id)
             continue
-        if not any(_cell(row, index) for index in (0, 1, 2, 3, 5, 6)):
+        if not any(_cell(row, index) for index in (0, 1, 2, 3)):
             continue
-        clear_requests.extend(
-            [
-                {
-                    "range": f"A{row_index}:D{row_index}",
-                    "values": [["", "", "", ""]],
-                },
-                {
-                    "range": f"F{row_index}:G{row_index}",
-                    "values": [["", ""]],
-                },
-            ]
+        clear_requests.append(
+            {
+                "range": f"A{row_index}:D{row_index}",
+                "values": [["", "", "", ""]],
+            }
         )
     if clear_requests:
         worksheet.batch_update(clear_requests, value_input_option="RAW")
@@ -1138,14 +1148,7 @@ def _project_outbox_event(
             raise ValueError("The local player for this projection no longer exists.")
         _project_player(
             players_worksheet,
-            {
-                "guild_id": current.guild_id,
-                "discord_user_id": current.discord_user_id,
-                "nickname": current.nickname,
-                "is_in_guild": current.is_active,
-                "silver": current.silver,
-                "revision": current.revision,
-            },
+            current,
             row_cache=player_rows,
             ensure_headers=False,
         )
@@ -1157,14 +1160,7 @@ def _project_outbox_event(
             raise ValueError("The local player for this projection no longer exists.")
         _project_player(
             players_worksheet,
-            {
-                "guild_id": current.guild_id,
-                "discord_user_id": current.discord_user_id,
-                "nickname": current.nickname,
-                "is_in_guild": current.is_active,
-                "silver": current.silver,
-                "revision": current.revision,
-            },
+            current,
             row_cache=player_rows,
             ensure_headers=False,
         )
@@ -1185,14 +1181,7 @@ def _project_outbox_event(
             if player is not None:
                 _project_player(
                     players_worksheet,
-                    {
-                        "guild_id": player.guild_id,
-                        "discord_user_id": player.discord_user_id,
-                        "nickname": player.nickname,
-                        "is_in_guild": player.is_active,
-                        "silver": player.silver,
-                        "revision": player.revision,
-                    },
+                    player,
                     row_cache=player_rows,
                     ensure_headers=False,
                 )
@@ -1350,6 +1339,86 @@ async def flush_outbox(guild_id: int, *, limit: int = 100) -> SyncResult:
     return await external_io.run_google(flush_outbox_sync, guild_id, limit=limit)
 
 
+def _project_linked_players_unlocked(
+    guild_id: int,
+    discord_user_ids: Sequence[int],
+) -> SyncResult:
+    """Best-effort direct Players projection without consuming the outbox."""
+
+    credentials_info = credential_store.get_credentials_info(guild_id)
+    if not credentials_info:
+        return SyncResult(
+            False,
+            "Google Sheet credentials are not linked or readable.",
+            incomplete=True,
+        )
+    try:
+        ledger = _active_ledger(guild_id, credentials_info)
+        if not local_repository.has_completed_sheet_import(
+            ledger.ledger_id,
+            "google-bootstrap-v1",
+        ):
+            return SyncResult(
+                False,
+                "Google Sheet cutover must complete before projecting Silver.",
+                incomplete=True,
+            )
+
+        unique_ids = tuple(dict.fromkeys(int(value) for value in discord_user_ids))
+        players: list[local_repository.PlayerRecord] = []
+        for discord_user_id in unique_ids:
+            player = local_repository.get_player(ledger.ledger_id, discord_user_id)
+            if player is None:
+                return SyncResult(
+                    False,
+                    f"Discord ID {discord_user_id} is not registered locally.",
+                    incomplete=True,
+                )
+            players.append(player)
+        if not players:
+            return SyncResult(True, "No player rows required projection.")
+
+        worksheet = google_sheets.get_worksheets(
+            guild_id,
+            (google_sheets.WORKSHEET_TYPE_PLAYERS,),
+        )[google_sheets.WORKSHEET_TYPE_PLAYERS]
+        _project_players(worksheet, players)
+    except Exception as error:
+        LOGGER.exception("Direct Players projection failed for guild %s", guild_id)
+        return SyncResult(False, str(error), incomplete=True)
+    return SyncResult(
+        True,
+        f"Projected {len(players)} current player row(s) to Google Sheets.",
+    )
+
+
+def project_linked_players_sync(
+    guild_id: int,
+    discord_user_ids: Sequence[int],
+) -> Optional[SyncResult]:
+    """Immediately rewrite current A:D rows for changed players when linked.
+
+    The durable outbox remains untouched so player and history projections are
+    still retried in FIFO order. An absent optional link is a normal no-op.
+    """
+
+    if document_store.get_google_sheet_link(guild_id) is None:
+        return None
+    with _sync_lock(guild_id):
+        return _project_linked_players_unlocked(guild_id, discord_user_ids)
+
+
+async def project_linked_players(
+    guild_id: int,
+    discord_user_ids: Sequence[int],
+) -> Optional[SyncResult]:
+    return await external_io.run_google(
+        project_linked_players_sync,
+        guild_id,
+        tuple(discord_user_ids),
+    )
+
+
 def _rebuild_projection_sync_unlocked(guild_id: int) -> SyncResult:
     """Reconcile every bot-owned Google projection field from authoritative SQLite.
 
@@ -1430,22 +1499,23 @@ async def rebuild_projection(guild_id: int) -> SyncResult:
     return await external_io.run_google(rebuild_projection_sync, guild_id)
 
 
-def _refresh_siphon_sync_unlocked(
-    guild_id: int,
-    *,
-    flush_pending: bool = True,
-) -> SyncResult:
-    processed_events = 0
-    if flush_pending:
-        projection = _flush_outbox_sync_unlocked(guild_id)
-        if not projection.success:
-            return projection
-        processed_events = projection.processed_events
+def _sync_siphon_from_sheet_unlocked(guild_id: int) -> SyncResult:
+    """Replace the local Siphon snapshot from one explicit Sheet read."""
+
     credentials_info = credential_store.get_credentials_info(guild_id)
     if not credentials_info:
         return SyncResult(False, "Google Sheet credentials are not linked or readable.")
 
     ledger_id = _active_ledger(guild_id, credentials_info).ledger_id
+    if not local_repository.has_completed_sheet_import(
+        ledger_id,
+        "google-bootstrap-v1",
+    ):
+        return SyncResult(
+            False,
+            "Google Sheet cutover must complete before synchronizing Siphon.",
+            incomplete=True,
+        )
 
     worksheet = google_sheets.get_worksheets(
         guild_id,
@@ -1456,49 +1526,35 @@ def _refresh_siphon_sync_unlocked(
     expected_players = local_repository.list_active_players(ledger_id)
     siphon_updates: list[local_repository.SiphonUpdate] = []
     rows_by_discord_id: dict[int, set[int]] = {}
-    rows_by_registration_id: dict[str, set[int]] = {}
     for row_index, row in enumerate(rows[1:], start=1):
-        raw_discord_id = _cell(row, 0)
         try:
-            parsed_discord_id = _parse_integer(raw_discord_id, allow_blank=True)
+            parsed_discord_id = _parse_integer(_raw_cell(row, 0), allow_blank=True)
         except ValueError:
             parsed_discord_id = None
         if parsed_discord_id is not None and parsed_discord_id > 0:
             rows_by_discord_id.setdefault(parsed_discord_id, set()).add(row_index)
-        registration_id = _cell(row, 5)
-        if registration_id:
-            rows_by_registration_id.setdefault(registration_id, set()).add(row_index)
 
     for player in expected_players:
-        registration_id = f"{ledger_id}:{player.discord_user_id}"
         candidate_indices = set(rows_by_discord_id.get(player.discord_user_id, set()))
-        candidate_indices.update(rows_by_registration_id.get(registration_id, set()))
         if len(candidate_indices) != 1:
             continue
         row = rows[next(iter(candidate_indices))]
-        if (
-            _cell(row, 0) != str(player.discord_user_id)
-            or _cell(row, 2).upper() != "YES"
-            or _cell(row, 5) != registration_id
-        ):
+        if _cell(row, 2).upper() != "YES":
             continue
         try:
-            sheet_silver = _parse_integer(_cell(row, 3))
-            siphon = _parse_integer(_cell(row, 4), allow_blank=True)
-            expected_revision = _parse_integer(_cell(row, 6), allow_blank=True)
+            sheet_silver = _parse_integer(_raw_cell(row, 3), allow_blank=True)
+            siphon = _parse_integer(_raw_cell(row, 4), allow_blank=True)
         except (TypeError, ValueError):
             continue
-        if siphon is None or expected_revision is None:
+        if sheet_silver is None or siphon is None:
             continue
         if sheet_silver != player.silver:
-            continue
-        if expected_revision != player.revision:
             continue
         siphon_updates.append(
             local_repository.SiphonUpdate(
                 discord_user_id=player.discord_user_id,
                 siphon=siphon,
-                expected_revision=expected_revision,
+                expected_revision=player.revision,
             )
         )
     cache_results = local_repository.cache_siphons(
@@ -1515,15 +1571,15 @@ def _refresh_siphon_sync_unlocked(
     return SyncResult(
         complete,
         (
-            "Siphon refreshed from Google Sheets."
+            "Siphon synchronized from Google Sheets."
             if complete
             else (
-                "Siphon refresh is incomplete: "
+                "Siphon synchronization is incomplete: "
                 f"{rejected} of {expected} active player rows were missing, "
-                "duplicated, stale, or invalid. Their cached Siphon values were cleared."
+                "duplicated, had stale Silver, or contained invalid values. "
+                "Their cached Siphon values were cleared."
             )
         ),
-        processed_events=processed_events,
         updated_siphon_rows=updated,
         expected_siphon_rows=expected,
         rejected_siphon_rows=rejected,
@@ -1531,23 +1587,19 @@ def _refresh_siphon_sync_unlocked(
     )
 
 
-def refresh_siphon_sync(guild_id: int, *, flush_pending: bool = True) -> SyncResult:
+def sync_siphon_from_sheet_sync(guild_id: int) -> SyncResult:
     with _sync_lock(guild_id):
-        return _refresh_siphon_sync_unlocked(
-            guild_id,
-            flush_pending=flush_pending,
-        )
+        try:
+            return _sync_siphon_from_sheet_unlocked(guild_id)
+        except Exception as error:
+            LOGGER.exception("Siphon synchronization failed for guild %s", guild_id)
+            return SyncResult(False, str(error), incomplete=True)
 
 
-async def refresh_siphon(
-    guild_id: int,
-    *,
-    flush_pending: bool = True,
-) -> SyncResult:
+async def sync_siphon_from_sheet(guild_id: int) -> SyncResult:
     return await external_io.run_google(
-        refresh_siphon_sync,
+        sync_siphon_from_sheet_sync,
         guild_id,
-        flush_pending=flush_pending,
     )
 
 
@@ -1568,7 +1620,7 @@ async def _sync_loop() -> None:
                 try:
                     bootstrap = await bootstrap_guild(guild_id)
                     if bootstrap.success:
-                        await refresh_siphon(guild_id, flush_pending=True)
+                        await flush_outbox(guild_id)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1616,7 +1668,6 @@ async def stop_google_sync() -> None:
 
 __all__ = [
     "MAX_OUTBOX_ATTEMPTS",
-    "SIPHON_STALE_AFTER_SECONDS",
     "SYNC_INTERVAL_SECONDS",
     "SyncResult",
     "bootstrap_all_linked_sheets",
@@ -1625,10 +1676,12 @@ __all__ = [
     "flush_outbox",
     "flush_outbox_sync",
     "is_cutover_ready",
+    "project_linked_players",
+    "project_linked_players_sync",
     "rebuild_projection",
     "rebuild_projection_sync",
-    "refresh_siphon",
-    "refresh_siphon_sync",
     "start_google_sync",
     "stop_google_sync",
+    "sync_siphon_from_sheet",
+    "sync_siphon_from_sheet_sync",
 ]

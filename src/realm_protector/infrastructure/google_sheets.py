@@ -35,6 +35,8 @@ class WorksheetPort(Protocol):
 
     def batch_update(self, requests: list[dict[str, Any]], **kwargs: Any) -> Any: ...
 
+    def batch_clear(self, ranges: list[str]) -> Any: ...
+
 
 GOOGLE_SHEET_SCOPES = (
     "https://www.googleapis.com/auth/spreadsheets,"

@@ -3,8 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import discord
 from discord import app_commands
@@ -20,12 +19,13 @@ from src.realm_protector.infrastructure import (
     guild_settings,
     local_repository,
 )
-from src.realm_protector.services import google_sync, guild_lifecycle, request_limits
-from src.realm_protector.services.authorization import is_admin
-from src.realm_protector.services.keyed_locks import KeyedLockPool
-from src.realm_protector.services.role_security import (
-    member_has_safe_privileged_role,
+from src.realm_protector.services import (
+    economy_access,
+    google_sync,
+    guild_lifecycle,
+    request_limits,
 )
+from src.realm_protector.services.keyed_locks import KeyedLockPool
 
 if TYPE_CHECKING:
     from src.realm_protector.bot.client import RealmProtectorBot
@@ -51,25 +51,6 @@ def _active_ledger_id(discord_guild_id: int) -> int:
     if ledger_id is None:
         raise RuntimeError("No active local ledger is configured for this server.")
     return ledger_id
-
-
-def _has_named_role(member: discord.Member, role_names: list[str]) -> bool:
-    return member_has_safe_privileged_role(member, role_names=role_names)
-
-
-async def _has_economy_access(member: discord.Member, guild_id: int) -> bool:
-    if await is_admin(member):
-        return True
-    configured_role_ids = guild_settings.get_economy_manager_role_ids(guild_id)
-    if configured_role_ids:
-        return member_has_safe_privileged_role(
-            member,
-            role_ids=configured_role_ids,
-        )
-    return _has_named_role(
-        member,
-        guild_settings.get_economy_manager_roles(guild_id),
-    )
 
 
 async def _ensure_local_ledger_ready(interaction: discord.Interaction) -> bool:
@@ -118,22 +99,8 @@ def _format_siphon(snapshot, *, google_linked: bool) -> str:
     if not google_linked:
         return "Unavailable (Google Sheet not linked)"
     if snapshot.siphon is None or snapshot.siphon_revision != snapshot.revision:
-        return "Pending Google calculation"
-    value = f"{snapshot.siphon:,} :oil:"
-    if not snapshot.siphon_synced_at:
-        return value
-    try:
-        synchronized_at = datetime.fromisoformat(snapshot.siphon_synced_at)
-        if synchronized_at.tzinfo is None:
-            synchronized_at = synchronized_at.replace(tzinfo=timezone.utc)
-        age_seconds = (
-            datetime.now(timezone.utc) - synchronized_at.astimezone(timezone.utc)
-        ).total_seconds()
-    except (TypeError, ValueError):
-        return value + " (sync time unknown)"
-    if age_seconds > google_sync.SIPHON_STALE_AFTER_SECONDS:
-        return value + " (stale)"
-    return value
+        return "Pending /sync-siphon"
+    return f"{snapshot.siphon:,} :oil:"
 
 
 def _build_balance_embed(
@@ -368,6 +335,29 @@ def _build_balance_update_embed(
     return embed
 
 
+async def _project_linked_players_after_commit(
+    discord_guild_id: int,
+    discord_user_ids: Sequence[int],
+) -> Optional[google_sync.SyncResult]:
+    """Best-effort Players update; SQLite and its outbox already committed."""
+
+    try:
+        return await google_sync.project_linked_players(
+            discord_guild_id,
+            discord_user_ids,
+        )
+    except Exception:
+        LOGGER.exception(
+            "Immediate Google projection failed in guild %s",
+            discord_guild_id,
+        )
+        return google_sync.SyncResult(
+            False,
+            "Google projection failed unexpectedly and remains queued for retry.",
+            incomplete=True,
+        )
+
+
 async def _handle_balance_change(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -386,7 +376,7 @@ async def _handle_balance_change(
         )
         return
 
-    if not await _has_economy_access(actor, guild.id):
+    if not await economy_access.has_economy_access(actor, guild.id):
         await interaction.response.send_message(
             "You don't have permission to use this command.",
             ephemeral=True,
@@ -464,6 +454,7 @@ async def _handle_balance_change(
         await interaction.followup.send(f"{member.mention} is not registered.")
         return
 
+    projection = await _project_linked_players_after_commit(guild.id, (member.id,))
     actual_delta = result.actual_delta
     action_text = "removed" if remove else "added"
     amount_text = f"{abs(actual_delta):,}"
@@ -476,6 +467,8 @@ async def _handle_balance_change(
         result.previous_balance,
         result.updated_balance,
     )
+    if projection is not None and not projection.success:
+        embed.set_footer(text="Saved in SQLite; the Google Sheet update is queued for retry.")
     await interaction.followup.send(embed=embed)
 
 
@@ -504,7 +497,7 @@ def create_economy_commands(
                 ephemeral=True,
             )
             return
-        if not await _has_economy_access(actor, guild.id):
+        if not await economy_access.has_economy_access(actor, guild.id):
             await interaction.response.send_message(
                 "You don't have permission to use this command.",
                 ephemeral=True,
@@ -609,6 +602,14 @@ def create_economy_commands(
                 await interaction.followup.send("Failed to process the lootsplit. Try again.")
                 return
 
+        projection = (
+            await _project_linked_players_after_commit(
+                guild.id,
+                tuple(credit.discord_user_id for credit in result.credits),
+            )
+            if result.credits
+            else None
+        )
         lines = [f"Lootsplit for **{content_name}**:"]
         if result.credits:
             lines.extend(f"<@{credit.discord_user_id}>: {amount};" for credit in result.credits)
@@ -616,6 +617,13 @@ def create_economy_commands(
             lines.append("No participants were processed successfully.")
         if result.missing_nicknames:
             lines.extend(["", f"Missing players: **{', '.join(result.missing_nicknames)}**"])
+        if projection is not None and not projection.success:
+            lines.extend(
+                [
+                    "",
+                    "SQLite was updated; the Google Sheet update is queued for retry.",
+                ]
+            )
         await send_followup_lines(
             interaction,
             lines,
@@ -675,7 +683,7 @@ def create_economy_commands(
                 ephemeral=True,
             )
             return
-        if not await _has_economy_access(actor, guild.id):
+        if not await economy_access.has_economy_access(actor, guild.id):
             await interaction.response.send_message(
                 "You don't have permission to use this command.",
                 ephemeral=True,
@@ -691,25 +699,22 @@ def create_economy_commands(
         )
         if not credentials_info:
             await interaction.followup.send(
-                "Siphon requires an optional Google Sheet link. Ask an admin to run **/bot-link-google-sheet**."
+                "Siphon requires an active Google Sheet link. "
+                "Ask an admin to run **/bot-link-google-sheet**."
             )
             return
-        sync_result = await google_sync.refresh_siphon(guild.id, flush_pending=True)
-        if not sync_result.success:
-            await interaction.followup.send(
-                "Siphon could not be refreshed from Google Sheets: " + sync_result.message
-            )
-            return
-
         async with guild_lifecycle.lock_for(guild.id):
             ledger_id = await asyncio.to_thread(_active_ledger_id, guild.id)
             negative_players = await asyncio.to_thread(
                 local_repository.list_negative_siphon,
                 ledger_id,
-                max_age_seconds=google_sync.SIPHON_STALE_AFTER_SECONDS,
+                active_only=True,
             )
         if not negative_players:
-            await interaction.followup.send("No users have a negative Siphon balance.")
+            await interaction.followup.send(
+                "No active users have a negative synchronized Siphon balance. "
+                "Run **/sync-siphon** to import the latest Sheet values."
+            )
             return
         lines = ["## Users with negative Siphon :oil: balance:"]
         lines.extend(

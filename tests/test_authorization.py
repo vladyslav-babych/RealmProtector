@@ -2,8 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from src.realm_protector.bot import composition, economy_commands
-from src.realm_protector.services import authorization
+from src.realm_protector.bot import composition
+from src.realm_protector.services import authorization, economy_access
 
 
 def _member_with_role(role_id: int, role_name: str):
@@ -55,29 +55,29 @@ class EconomyAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(
-                economy_commands,
+                economy_access,
                 "is_admin",
                 new=AsyncMock(return_value=False),
             ),
             patch.object(
-                economy_commands.guild_settings,
+                economy_access.guild_settings,
                 "get_economy_manager_role_ids",
                 return_value=[321],
             ),
             patch.object(
-                economy_commands.guild_settings,
+                economy_access.guild_settings,
                 "get_economy_manager_roles",
                 return_value=["Economy Manager"],
             ) as get_legacy_names,
         ):
             self.assertFalse(
-                await economy_commands._has_economy_access(
+                await economy_access.has_economy_access(
                     legacy_name_match,
                     guild_id=10,
                 )
             )
             self.assertTrue(
-                await economy_commands._has_economy_access(
+                await economy_access.has_economy_access(
                     renamed_role_id_match,
                     guild_id=10,
                 )
@@ -92,22 +92,22 @@ class EconomyAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(
-                economy_commands,
+                economy_access,
                 "is_admin",
                 new=AsyncMock(return_value=False),
             ),
             patch.object(
-                economy_commands.guild_settings,
+                economy_access.guild_settings,
                 "get_economy_manager_role_ids",
                 return_value=[],
             ),
             patch.object(
-                economy_commands.guild_settings,
+                economy_access.guild_settings,
                 "get_economy_manager_roles",
                 return_value=["Economy Manager"],
             ),
         ):
-            self.assertTrue(await economy_commands._has_economy_access(member, guild_id=10))
+            self.assertTrue(await economy_access.has_economy_access(member, guild_id=10))
 
 
 class AutomaticRoleSafetyTests(unittest.TestCase):
