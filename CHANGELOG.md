@@ -6,6 +6,14 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ## [Unreleased]
 
+## [v2.0.2] - 2026-08-26
+
+### Changed
+
+- Member roles with the Discord `Create Instant Invite` permission can now be
+  assigned automatically during registration. Integration-managed roles and
+  the existing bot hierarchy checks remain restricted.
+
 ## [v2.0.1] - 2026-08-23
 
 ### Added

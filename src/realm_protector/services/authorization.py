@@ -10,6 +10,7 @@ _SAFE_AUTOMATIC_ROLE_PERMISSIONS = frozenset(
         "attach_files",
         "change_nickname",
         "connect",
+        "create_instant_invite",
         "create_private_threads",
         "create_public_threads",
         "embed_links",

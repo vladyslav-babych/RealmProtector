@@ -149,10 +149,11 @@ class AutomaticRoleSafetyTests(unittest.TestCase):
 
         self.assertIsNone(authorization.automatic_role_assignment_error(role, guild))
 
-    def test_mention_everyone_and_voice_status_permissions_are_assignable(self) -> None:
+    def test_explicitly_reviewed_member_permissions_are_assignable(self) -> None:
         guild = SimpleNamespace(id=10, me=None)
         role = self._role(
             guild,
+            create_instant_invite=True,
             mention_everyone=True,
             set_voice_channel_status=True,
         )
