@@ -115,9 +115,10 @@ Google Sheets is an optional projection and Siphon calculation engine; it is not
 Local-to-Google flow:
 
 1. A command commits authoritative SQLite state and an outbox event atomically.
-2. Balance and lootsplit commands directly rewrite the affected current Players
-   rows by Discord ID after the local commit. This best-effort fast path does not
-   consume or wait behind the outbox.
+2. Registration, forced re-registration, balance, and lootsplit commands
+   directly rewrite the affected current Players rows by Discord ID after the
+   local commit. This best-effort fast path does not consume or wait behind the
+   outbox.
 3. The background worker delivers and retries the complete FIFO player/history
    projection without importing Siphon.
 4. Stable event IDs make retries idempotent.

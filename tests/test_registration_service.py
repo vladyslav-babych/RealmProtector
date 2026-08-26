@@ -24,7 +24,8 @@ def _context_and_role():
 
 
 class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
-    def _base_patches(self, role, result):
+    def _base_patches(self, role, result, projection=None):
+        projection_mock = projection if projection is not None else AsyncMock(return_value=None)
         return (
             patch.object(
                 registration,
@@ -67,6 +68,11 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "_delete_side_effect_intent",
                 new=AsyncMock(),
             ),
+            patch.object(
+                registration,
+                "_project_registered_player_after_commit",
+                new=projection_mock,
+            ),
         )
 
     async def test_albion_id_conflict_never_changes_discord_member(self) -> None:
@@ -75,7 +81,8 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
             status=local_repository.RegistrationStatus.ALBION_ID_CONFLICT,
             player=None,
         )
-        base_patches = self._base_patches(role, result)
+        project_player = AsyncMock(return_value=None)
+        base_patches = self._base_patches(role, result, project_player)
         with ExitStack() as stack:
             for patcher in base_patches:
                 stack.enter_context(patcher)
@@ -95,6 +102,7 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         apply_effects.assert_not_awaited()
+        project_player.assert_not_awaited()
         context.send.assert_awaited_once_with("Character **Player** is already registered.")
 
     async def test_already_registered_does_not_promise_nickname_retry(self) -> None:
@@ -143,6 +151,112 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
             "You are already registered.\nI could not update your Discord nickname."
         )
 
+    async def test_created_registration_projects_the_player_after_local_success(self) -> None:
+        context, role = _context_and_role()
+        player = SimpleNamespace(
+            nickname="Canonical Player",
+            albion_player_id="same-albion-id",
+        )
+        result = SimpleNamespace(
+            status=local_repository.RegistrationStatus.CREATED,
+            player=player,
+        )
+        project_player = AsyncMock(
+            return_value=registration.google_sync.SyncResult(True, "projected")
+        )
+        base_patches = self._base_patches(role, result, project_player)
+        with ExitStack() as stack:
+            for patcher in base_patches:
+                stack.enter_context(patcher)
+            stack.enter_context(
+                patch.object(
+                    registration,
+                    "_apply_registration_side_effects",
+                    new=AsyncMock(return_value=(True, True)),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    registration,
+                    "_record_side_effect_result",
+                    new=AsyncMock(),
+                )
+            )
+            await registration.register_user(
+                context,
+                "Player",
+                "same-albion-id",
+                "Realm",
+                registration.guild_lifecycle.generation(context.guild.id),
+            )
+
+        project_player.assert_awaited_once_with(10, 20)
+        context.send.assert_awaited_once_with("**Canonical Player** was registered successfully.")
+
+    async def test_registration_survives_a_failed_google_projection(self) -> None:
+        context, role = _context_and_role()
+        player = SimpleNamespace(
+            nickname="Canonical Player",
+            albion_player_id="same-albion-id",
+        )
+        result = SimpleNamespace(
+            status=local_repository.RegistrationStatus.CREATED,
+            player=player,
+        )
+        project_player = AsyncMock(
+            return_value=registration.google_sync.SyncResult(
+                False,
+                "temporary failure",
+                incomplete=True,
+            )
+        )
+        base_patches = self._base_patches(role, result, project_player)
+        with ExitStack() as stack:
+            for patcher in base_patches:
+                stack.enter_context(patcher)
+            stack.enter_context(
+                patch.object(
+                    registration,
+                    "_apply_registration_side_effects",
+                    new=AsyncMock(return_value=(True, True)),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    registration,
+                    "_record_side_effect_result",
+                    new=AsyncMock(),
+                )
+            )
+            await registration.register_user(
+                context,
+                "Player",
+                "same-albion-id",
+                "Realm",
+                registration.guild_lifecycle.generation(context.guild.id),
+            )
+
+        self.assertIn(
+            "Google Sheet update remains queued",
+            context.send.await_args.args[0],
+        )
+
+    async def test_projection_helper_contains_an_unexpected_google_failure(self) -> None:
+        with (
+            patch.object(
+                registration.google_sync,
+                "project_linked_players",
+                new=AsyncMock(side_effect=RuntimeError("offline")),
+            ) as project_players,
+            self.assertLogs(registration.LOGGER, level="ERROR"),
+        ):
+            result = await registration._project_registered_player_after_commit(10, 20)
+
+        project_players.assert_awaited_once_with(10, (20,))
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertFalse(result.success)
+
     async def test_force_register_reactivates_without_resetting_local_player(self) -> None:
         role = SimpleNamespace(id=30, name="Member")
         member = SimpleNamespace(id=20, mention="<@20>", roles=[])
@@ -171,6 +285,7 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
             member_role_name="Member",
         )
 
+        project_player = AsyncMock(return_value=registration.google_sync.SyncResult(True, "done"))
         with (
             patch.object(
                 registration.guild_settings,
@@ -220,6 +335,11 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "_record_side_effect_result",
                 new=AsyncMock(),
             ) as record_effects,
+            patch.object(
+                registration,
+                "_project_registered_player_after_commit",
+                new=project_player,
+            ),
         ):
             message = await registration.force_register_member(guild, member)
 
@@ -231,6 +351,7 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
         apply_effects.assert_awaited_once_with(member, role, "Canonical Player")
         record_effects.assert_awaited_once()
+        project_player.assert_awaited_once_with(10, 20)
         self.assertIn("marked **in guild**", message)
 
     async def test_force_register_does_not_reactivate_wrong_albion_guild(self) -> None:

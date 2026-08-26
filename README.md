@@ -512,8 +512,10 @@ Required permissions for notifications:
   nickname change is reported but is not queued for a later retry.
 - Adds the configured Member role. A failed role assignment remains queued for
   recovery after restart and by the runtime reconciliation loop.
-- If Google is linked, the registration is projected asynchronously; Google
-  downtime does not roll back the local registration.
+- If Google is linked, immediately adds or refreshes the registered Discord ID
+  in the Players worksheet after SQLite commits. Google downtime does not roll
+  back the local registration, and new/reactivated registrations remain queued
+  for automatic projection retry.
 - Character search, selection, and progress remain ephemeral. After selection,
   the registration result is posted publicly in the channel.
 
@@ -527,6 +529,8 @@ Required permissions for notifications:
 - Preserves Silver, all-time earnings, histories, and existing registration data,
   then attempts the configured Member role and Discord nickname repairs. Only a
   failed Member-role repair is queued for a later retry.
+- If Google is linked, immediately refreshes the member's authoritative Players
+  row after the local registration is reactivated.
 
 ### `/bal [member]` and `!bal`
 
