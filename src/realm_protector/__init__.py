@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 MINIMUM_PYTHON = (3, 12)
 MAXIMUM_PYTHON = (3, 15)
-__version__ = "2.0.0"
+__version__ = "2.0.2"
 
 
 def validate_python_version(version_info: Sequence[int]) -> None:
