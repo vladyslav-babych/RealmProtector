@@ -6,6 +6,13 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ## [Unreleased]
 
+### Changed
+
+- Successful registrations and forced re-registrations now immediately add or
+  refresh the affected Discord ID in a linked Google Players worksheet after
+  SQLite commits. The durable outbox remains the retry path for new and
+  reactivated registrations.
+
 ## [v2.0.2] - 2026-08-26
 
 ### Changed

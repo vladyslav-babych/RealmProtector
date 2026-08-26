@@ -17,7 +17,7 @@ from src.realm_protector.infrastructure import (
     local_repository,
     runtime_state,
 )
-from src.realm_protector.services import guild_lifecycle
+from src.realm_protector.services import google_sync, guild_lifecycle
 from src.realm_protector.services.keyed_locks import KeyedLockPool
 from src.realm_protector.services.role_security import self_assignment_error
 
@@ -45,6 +45,27 @@ async def _commit_registration(
         player_name,
         albion_player_id,
     )
+
+
+async def _project_registered_player_after_commit(
+    guild_id: int,
+    discord_id: int,
+) -> Optional[google_sync.SyncResult]:
+    """Best-effort immediate projection after the authoritative local commit."""
+
+    try:
+        return await google_sync.project_linked_players(guild_id, (discord_id,))
+    except Exception:
+        LOGGER.exception(
+            "Immediate registration projection failed for user %s in guild %s",
+            discord_id,
+            guild_id,
+        )
+        return google_sync.SyncResult(
+            False,
+            "Google projection failed unexpectedly.",
+            incomplete=True,
+        )
 
 
 async def sync_discord_nickname(
@@ -399,6 +420,7 @@ async def force_register_member(
                 role_added=role_added,
             )
 
+    projection = await _project_registered_player_after_commit(guild.id, member.id)
     message = (
         f"{member.mention}'s character **{canonical_player.nickname}** was verified in "
         f"**{configuration.target_guild_name}** and is now marked **in guild**."
@@ -408,6 +430,13 @@ async def force_register_member(
         warnings.append("I could not update the Discord nickname.")
     if not role_added:
         warnings.append("Member-role repair is pending.")
+    if projection is not None and not projection.success:
+        if registration_result.status == local_repository.RegistrationStatus.ALREADY_REGISTERED:
+            warnings.append(
+                "I could not refresh the Google Sheet row; an admin can run **/sync-rebuild**."
+            )
+        else:
+            warnings.append("The Google Sheet update remains queued for automatic retry.")
     if warnings:
         message += "\n" + " ".join(warnings)
     return message
@@ -563,6 +592,7 @@ async def register_user(
                 role_added=role_added,
             )
 
+    projection = await _project_registered_player_after_commit(guild_id, discord_id)
     if result.status == local_repository.RegistrationStatus.ALREADY_REGISTERED:
         message = "You are already registered."
     elif result.status == local_repository.RegistrationStatus.REACTIVATED:
@@ -576,6 +606,13 @@ async def register_user(
         warnings.append("I could not update your Discord nickname.")
     if not role_added:
         warnings.append("I could not add the configured Member role; I will retry after restart.")
+    if projection is not None and not projection.success:
+        if result.status == local_repository.RegistrationStatus.ALREADY_REGISTERED:
+            warnings.append(
+                "I could not refresh your Google Sheet row; ask an admin to run **/sync-rebuild**."
+            )
+        else:
+            warnings.append("The Google Sheet update remains queued for automatic retry.")
     if warnings:
         message += "\n" + " ".join(warnings)
     await context.send(message)
