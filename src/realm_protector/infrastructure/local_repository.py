@@ -54,6 +54,7 @@ class TargetGuildConflictError(RepositoryError):
 class RegistrationStatus(str, Enum):
     CREATED = "created"
     REACTIVATED = "reactivated"
+    UPDATED = "updated"
     ALREADY_REGISTERED = "already_registered"
     NICKNAME_CONFLICT = "nickname_conflict"
     ALBION_ID_CONFLICT = "albion_id_conflict"
@@ -1519,9 +1520,14 @@ def register_player(
     nickname: str,
     albion_player_id: Optional[str] = None,
     *,
+    replace_character: bool = False,
     database_path: DatabasePath = None,
 ) -> RegistrationResult:
-    """Create or reactivate a registration without ever resetting Silver."""
+    """Create/reactivate a player; only explicit admin recovery may replace an active character.
+
+    Character changes preserve the Discord account's balances and history and
+    still enforce ownership conflicts within the active ledger.
+    """
 
     _validate_identifier(guild_id, "guild_id")
     _validate_identifier(discord_user_id, "discord_user_id")
@@ -1583,8 +1589,12 @@ def register_player(
             )
             player = _row_to_player(_require_player_row(connection, guild_id, discord_user_id))
             status = RegistrationStatus.CREATED
-        elif bool(existing["is_active"]):
-            if existing["albion_player_id"] is None and clean_albion_id is not None:
+        elif bool(existing["is_active"]) and not replace_character:
+            if (
+                existing["albion_player_id"] is None
+                and clean_albion_id is not None
+                and existing["nickname_key"] == nickname_key
+            ):
                 connection.execute(
                     """
                     UPDATE registered_players
@@ -1597,6 +1607,14 @@ def register_player(
             return RegistrationResult(RegistrationStatus.ALREADY_REGISTERED, player)
         else:
             next_albion_id = clean_albion_id or existing["albion_player_id"]
+            if (
+                bool(existing["is_active"])
+                and existing["nickname"] == clean_nickname
+                and existing["albion_player_id"] == next_albion_id
+            ):
+                return RegistrationResult(
+                    RegistrationStatus.ALREADY_REGISTERED, _row_to_player(existing)
+                )
             connection.execute(
                 """
                 UPDATE registered_players
@@ -1616,7 +1634,11 @@ def register_player(
                 ),
             )
             player = _row_to_player(_require_player_row(connection, guild_id, discord_user_id))
-            status = RegistrationStatus.REACTIVATED
+            status = (
+                RegistrationStatus.UPDATED
+                if bool(existing["is_active"])
+                else RegistrationStatus.REACTIVATED
+            )
 
         outbox_event_id = _derived_uuid(
             "player.upsert",

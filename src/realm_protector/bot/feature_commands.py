@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord import app_commands
 
-from src.realm_protector.bot import objectives, reaction_roles, tickets
+from src.realm_protector.bot import objectives, reaction_roles, tickets, trial_setup, trials
 from src.realm_protector.services import utc_timer
 
 if TYPE_CHECKING:
@@ -13,6 +13,17 @@ if TYPE_CHECKING:
 
 
 def create_feature_commands(bot: "RealmProtectorBot") -> list[app_commands.Command]:
+    @app_commands.command(name="trial-setup", description="Configure private player trials")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def trial_setup_command(interaction: discord.Interaction) -> None:
+        await trial_setup.handle_trial_setup(interaction)
+
+    @app_commands.command(name="trial-add", description="Start a trial for a registered player")
+    @app_commands.guild_only()
+    async def trial_add(interaction: discord.Interaction, member: discord.Member) -> None:
+        await trials.handle_trial_add(interaction, member)
+
     @app_commands.command(
         name="tickets-setup",
         description="Configure ticket panels for guild applications",
@@ -46,6 +57,8 @@ def create_feature_commands(bot: "RealmProtectorBot") -> list[app_commands.Comma
         await utc_timer.handle_add_utc_timer_slash(interaction)
 
     return [
+        trial_setup_command,
+        trial_add,
         tickets_setup,
         role_reaction_setup,
         set_objective_panel,

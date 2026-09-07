@@ -146,6 +146,8 @@ Google synchronization, and transactional balance accounting.
 - `/bot-link-google-sheet`
 - `/bot-remove`
 - `/tickets-setup`
+- `/trial-setup`
+- `/trial-add @User`
 - `/role-reaction-setup`
 - `/set-objective-panel`
 - `/update-config`
@@ -174,6 +176,8 @@ Google synchronization, and transactional balance accounting.
 	- Allowed for Admins OR members with configured Caller role(s)
 - Objective add/remove actions:
 	- Allowed for Admins OR members with configured Caller role(s)
+- `/trial-setup`: administrators only. `/trial-add` and End Trial: administrators
+  or the configured Trial Manager roles (active trials use their original roles).
 - `/register`, `/bal`, `!bal`, `!lb`, `/get-participants`, and normal thread self sign-up/sign-out are available without admin requirement.
 
 Caller, Economy Manager, and ticket-management roles may also be configured as
@@ -181,6 +185,47 @@ the Member role or a reaction role. This intentionally allows users to acquire
 the associated privileged bot actions through that self-assignment workflow.
 
 ## Bot setup and configuration
+
+### Player trials
+
+Run `/trial-setup` in the text channel where the trial configuration panel should
+appear. The private, seven-step wizard selects the category, one Trial role,
+multiple Trial Manager roles, archive text channel, panel title and panel message,
+then shows an overview for confirmation. Native selectors search server categories
+and roles; up to 25 manager roles can be selected. Each selection has a preview.
+The wizard follows the Bot Setup/Ticket Panel Setup layout: numbered steps,
+emoji instructions, labeled previews, Back and Save and Continue, dedicated
+Set Panel Title/Set Panel Message buttons, and a final Confirm Setup screen.
+Drafts are stored in SQLite: run `/trial-setup` again to resume an expired menu.
+An open text modal must be reopened if the bot restarts before it is submitted.
+
+Administrators and Trial Managers use `/trial-add @User` for a player registered
+in the current local ledger. It grants the Trial role if needed and creates one
+`albionname-trial` text channel, with the configured message and End Trial button.
+Only that player, Trial Managers and the bot receive explicit access. Discord
+administrators can always access channels. The Trial role itself does not grant
+access to other trial channels and cannot also be a Trial Manager role.
+
+End Trial is restricted to administrators and that trial's managers. It freezes
+the conversation and uses the ticket transcript engine to copy messages and
+attachments into an archive thread. The source is deleted only after the archive
+completes, then the Trial role is removed, including a role the player already had
+before their trial. No registration, balances or player history are deleted.
+
+The bot needs Manage Channels in the category, Manage Roles and a higher role
+than the Trial role. The archive must be hidden from `@everyone`; configure its
+other role grants to match your intended archive audience. The bot also needs
+View Channel, Send Messages, Read Message History, Create Public Threads, Send
+Messages in Threads, Embed Links and Attach Files there. Keep the archive outside
+the trial source channels and do not manually delete an unarchived trial.
+
+Configuration, draft setup, publication intents and trial progress are persisted
+in SQLite's `runtime_records`; no additional JSON file or Google Sheet is needed.
+Pending operations retry on startup and through the existing 60-second recovery
+loop. Fix missing permissions/resources if an operation remains pending (the
+error is saved as `last_error` and logged). Known missing source channels are not
+silently replaced; their transcripts require manual recovery. Active trials retain
+their original role, managers, message and archive destination after setup changes.
 
 ### `/bot-setup`
 
@@ -519,18 +564,34 @@ Required permissions for notifications:
 - Character search, selection, and progress remain ephemeral. After selection,
   the registration result is posted publicly in the channel.
 
-### `/force-register <member>`
+### `/force-register <member> <albionname>`
 
-- Admin-only recovery command for an existing registered Discord member.
-- Rechecks the stored Albion character by stable Albion ID, or by exact nickname
-  for a legacy registration, and retries briefly for Albion propagation delays.
-- Changes the registration back to `Is In Guild = YES` only after the Albion API
+- Admin-only command to create a missing registration or update an existing one.
+- Searches `albionname` and shows the same first-three-character stats panel as
+  `/register`, with **1**, **2**, **3** and **Cancel** buttons. Missing results have
+  disabled buttons. The picker and result are visible only to the requesting admin.
+- After selection, rechecks admin permissions and the target member's presence,
+  then verifies the selected character's fresh profile by stable Albion ID,
+  retrying briefly for membership propagation. It does not repeat the nickname
+  search or automatically choose the first result.
+- Sets `Is In Guild = YES` only after the Albion API
   confirms membership in the configured guild.
-- Preserves Silver, all-time earnings, histories, and existing registration data,
-  then attempts the configured Member role and Discord nickname repairs. Only a
+- An existing Discord account can be updated to the supplied character without
+  resetting Silver, all-time earnings or history. Character changes invalidate
+  cached Siphon until the next `/sync-siphon` and enqueue a Google player update.
+- Attempts the configured Member role and Discord nickname repairs. Only a
   failed Member-role repair is queued for a later retry.
 - If Google is linked, immediately refreshes the member's authoritative Players
-  row after the local registration is reactivated.
+  row after SQLite commits. New/changed players also have a durable outbox retry.
+- A character linked to another Discord account is rejected with its owning
+  Discord ID for admin review when that link is in this server's active ledger;
+  the command does not transfer ownership or balances, even if that account left.
+- Character registrations in other Discord servers or archived ledger generations
+  do not block registration here. Albion must still confirm that the selected
+  character belongs to this server's configured Albion guild.
+- `/register` distinguishes an existing registration for your Discord account
+  from a selected character linked to someone else. Both commands use the current
+  SQLite ledger and wait for any pending initial Google migration.
 
 ### `/bal [member]` and `!bal`
 
