@@ -1,9 +1,16 @@
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from src.realm_protector.infrastructure import albion_api, local_repository, runtime_state
+from src.realm_protector.infrastructure import (
+    albion_api,
+    local_repository,
+    runtime_state,
+    sqlite_database,
+)
 from src.realm_protector.services import registration
 
 
@@ -103,7 +110,7 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         apply_effects.assert_not_awaited()
         project_player.assert_not_awaited()
-        context.send.assert_awaited_once_with("Character **Player** is already registered.")
+        context.send.assert_awaited_once_with(registration._character_conflict_message("Player"))
 
     async def test_already_registered_does_not_promise_nickname_retry(self) -> None:
         context, role = _context_and_role()
@@ -148,7 +155,7 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
         record_effects.assert_awaited_once()
         context.send.assert_awaited_once_with(
-            "You are already registered.\nI could not update your Discord nickname."
+            "Your Discord account is already registered as **Canonical Player**.\nI could not update your Discord nickname."
         )
 
     async def test_created_registration_projects_the_player_after_local_success(self) -> None:
@@ -304,7 +311,7 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 registration,
-                "_get_registered_player_profile_with_retries",
+                "_get_named_player_profile_with_retries",
                 new=AsyncMock(
                     return_value={
                         "Id": "stable-id",
@@ -341,13 +348,17 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
                 new=project_player,
             ),
         ):
-            message = await registration.force_register_member(guild, member)
+            with patch.object(registration.google_sync, "is_cutover_ready", return_value=True):
+                message = await registration.force_register_member(
+                    guild, member, "Canonical Player"
+                )
 
         register_player.assert_called_once_with(
             77,
             20,
             "Canonical Player",
             "stable-id",
+            replace_character=True,
         )
         apply_effects.assert_awaited_once_with(member, role, "Canonical Player")
         record_effects.assert_awaited_once()
@@ -379,7 +390,7 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 registration,
-                "_get_registered_player_profile_with_retries",
+                "_get_named_player_profile_with_retries",
                 new=AsyncMock(
                     return_value={
                         "Id": "stable-id",
@@ -393,7 +404,10 @@ class RegistrationMutationSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "register_player",
             ) as register_player,
         ):
-            message = await registration.force_register_member(guild, member)
+            with patch.object(registration.google_sync, "is_cutover_ready", return_value=True):
+                message = await registration.force_register_member(
+                    guild, member, "Canonical Player"
+                )
 
         register_player.assert_not_called()
         self.assertIn("registration was not changed", message)
@@ -606,6 +620,268 @@ class StableAlbionVerificationTests(unittest.IsolatedAsyncioTestCase):
             ["stable-id", "stable-id"],
             [call.args[1] for call in run_albion.await_args_list],
         )
+
+
+class ForceRegistrationSQLiteTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        stack = self.enterContext(ExitStack())
+        directory = stack.enter_context(TemporaryDirectory())
+        stack.enter_context(sqlite_database.database_path(Path(directory) / "registration.sqlite3"))
+        local_repository.ensure_schema()
+        local_repository.activate_ledger(10, "Realm")
+        self.context, self.role = _context_and_role()
+        self.member = self.context.author
+        self.member.mention = "<@20>"
+        self.guild = self.context.guild
+        self.profile = {"Id": "new-id", "Name": "NewPlayer", "GuildName": "Realm"}
+        self.lookup = stack.enter_context(
+            patch.object(
+                registration,
+                "_get_named_player_profile_with_retries",
+                new=AsyncMock(return_value=self.profile),
+            )
+        )
+        self.effects = stack.enter_context(
+            patch.object(
+                registration,
+                "_apply_registration_side_effects",
+                new=AsyncMock(return_value=(True, True)),
+            )
+        )
+        self.projection = stack.enter_context(
+            patch.object(
+                registration,
+                "_project_registered_player_after_commit",
+                new=AsyncMock(return_value=None),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                registration.guild_settings,
+                "get_configuration",
+                return_value=SimpleNamespace(
+                    target_guild_name="Realm", member_role_id=30, member_role_name="Member"
+                ),
+            )
+        )
+        stack.enter_context(patch.object(registration, "self_assignment_error", return_value=None))
+        self.cutover = stack.enter_context(
+            patch.object(registration.google_sync, "is_cutover_ready", return_value=True)
+        )
+
+    async def test_force_creates_unregistered_member_and_projects_after_sqlite_commit(self):
+        async def project(guild_id, discord_id):
+            self.assertIsNotNone(local_repository.get_player(10, discord_id))
+            return None
+
+        self.projection.side_effect = project
+        message = await registration.force_register_member(self.guild, self.member, " NewPlayer ")
+        player = local_repository.get_player(10, 20)
+        self.assertEqual("NewPlayer", player.nickname)
+        self.assertEqual("new-id", player.albion_player_id)
+        self.assertTrue(player.is_active)
+        self.assertEqual(0, player.silver)
+        self.assertIn("registered successfully", message)
+        self.lookup.assert_awaited_once_with("NewPlayer", "Realm")
+        self.effects.assert_awaited_once_with(self.member, self.role, "NewPlayer")
+        self.assertEqual([], runtime_state.list_records(registration._SIDE_EFFECT_RUNTIME_KIND))
+
+    async def test_force_registration_ignores_character_owned_in_another_server(self):
+        other = local_repository.activate_ledger(11, "Other Realm")
+        owner = local_repository.register_player(other.ledger_id, 21, "NewPlayer", "new-id").player
+        await registration.force_register_member(self.guild, self.member, "NewPlayer")
+        self.assertEqual("new-id", local_repository.get_player(10, 20).albion_player_id)
+        self.assertEqual(owner, local_repository.get_player(other.ledger_id, 21))
+
+    async def test_self_registration_ignores_character_owned_in_another_server(self):
+        other = local_repository.activate_ledger(11, "Other Realm")
+        owner = local_repository.register_player(other.ledger_id, 21, "NewPlayer", "new-id").player
+        with patch.object(
+            registration,
+            "_get_player_profile_with_retries",
+            new=AsyncMock(return_value=self.profile),
+        ):
+            await registration.register_user(self.context, "NewPlayer", "new-id", "Realm")
+        self.assertEqual("new-id", local_repository.get_player(10, 20).albion_player_id)
+        self.assertEqual(owner, local_repository.get_player(other.ledger_id, 21))
+        self.assertIn("registered successfully", self.context.send.await_args.args[0])
+
+    async def test_archived_registration_does_not_block_current_server_ledger(self):
+        owner = local_repository.register_player(10, 21, "NewPlayer", "new-id").player
+        local_repository.activate_ledger(10, "Temporary Realm")
+        current = local_repository.activate_ledger(10, "Realm")
+        self.assertNotEqual(10, current.ledger_id)
+        await registration.force_register_member(self.guild, self.member, "NewPlayer")
+        self.assertEqual(
+            "new-id", local_repository.get_player(current.ledger_id, 20).albion_player_id
+        )
+        self.assertEqual(owner, local_repository.get_player(10, 21))
+
+    async def test_selected_character_uses_stable_id_without_repeating_name_search(self):
+        with patch.object(
+            registration,
+            "_get_player_profile_with_retries",
+            new=AsyncMock(return_value=self.profile),
+        ) as verify:
+            await registration.force_register_member(
+                self.guild,
+                self.member,
+                "NewPlayer",
+                albion_player_id="new-id",
+                expected_target_guild_name="Realm",
+                expected_generation=registration.guild_lifecycle.generation(10),
+            )
+        verify.assert_awaited_once_with("new-id", "Realm")
+        self.lookup.assert_not_awaited()
+        self.assertIsNotNone(local_repository.get_player(10, 20))
+
+    async def test_selection_rejects_changed_configuration_before_api_or_mutation(self):
+        message = await registration.force_register_member(
+            self.guild,
+            self.member,
+            "NewPlayer",
+            albion_player_id="new-id",
+            expected_target_guild_name="Former Realm",
+        )
+        self.assertIn("configuration changed", message)
+        self.lookup.assert_not_awaited()
+        self.effects.assert_not_awaited()
+        self.assertIsNone(local_repository.get_player(10, 20))
+
+    async def test_force_replaces_active_character_preserving_finances_and_history(self):
+        local_repository.register_player(10, 20, "OldPlayer", "old-id")
+        local_repository.change_balance(10, 20, 500, idempotency_key="credit")
+        local_repository.change_balance(10, 20, -100, idempotency_key="debit")
+        original = local_repository.get_player(10, 20)
+        local_repository.cache_siphon(10, 20, -10, expected_revision=original.revision)
+        with sqlite_database.connection() as database:
+            history_before = [
+                tuple(row) for row in database.execute("SELECT * FROM balance_history")
+            ]
+        await registration.force_register_member(self.guild, self.member, "NewPlayer")
+        player = local_repository.get_player(10, 20)
+        self.assertEqual("NewPlayer", player.nickname)
+        self.assertEqual("new-id", player.albion_player_id)
+        self.assertEqual(400, player.silver)
+        self.assertEqual(500, player.all_time_earnings)
+        self.assertGreater(player.revision, original.revision)
+        self.assertIsNone(player.siphon)
+        with sqlite_database.connection() as database:
+            self.assertEqual(
+                history_before,
+                [tuple(row) for row in database.execute("SELECT * FROM balance_history")],
+            )
+            event = database.execute(
+                "SELECT payload_json FROM google_sync_outbox ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+        self.assertIn("NewPlayer", event[0])
+
+    async def test_foreign_character_conflict_does_not_create_target_or_modify_owner(self):
+        owner = local_repository.register_player(10, 21, "NewPlayer", "new-id").player
+        message = await registration.force_register_member(self.guild, self.member, "NewPlayer")
+        self.assertIn("Discord ID `21`", message)
+        self.assertIsNone(local_repository.get_player(10, 20))
+        self.assertEqual(owner, local_repository.get_player(10, 21))
+        self.effects.assert_not_awaited()
+        self.projection.assert_not_awaited()
+        self.assertEqual([], runtime_state.list_records(registration._SIDE_EFFECT_RUNTIME_KIND))
+
+    async def test_regular_registration_conflict_explains_other_account_not_target(self):
+        local_repository.register_player(10, 21, "NewPlayer", "new-id")
+        with patch.object(
+            registration,
+            "_get_player_profile_with_retries",
+            new=AsyncMock(return_value=self.profile),
+        ):
+            await registration.register_user(self.context, "NewPlayer", "new-id", "Realm")
+        self.assertIsNone(local_repository.get_player(10, 20))
+        self.assertIn("another Discord account", self.context.send.await_args.args[0])
+        self.effects.assert_not_awaited()
+
+    async def test_regular_registration_cannot_attach_another_characters_id_to_legacy_name(self):
+        local_repository.register_player(10, 20, "OldPlayer")
+        with patch.object(
+            registration,
+            "_get_player_profile_with_retries",
+            new=AsyncMock(return_value=self.profile),
+        ):
+            await registration.register_user(self.context, "NewPlayer", "new-id", "Realm")
+        player = local_repository.get_player(10, 20)
+        self.assertEqual("OldPlayer", player.nickname)
+        self.assertIsNone(player.albion_player_id)
+        self.assertIn("already registered as **OldPlayer**", self.context.send.await_args.args[0])
+
+    async def test_api_failure_or_not_found_never_registers(self):
+        for response in (None, albion_api.AlbionResponseError("bad response")):
+            self.lookup.side_effect = response if isinstance(response, Exception) else None
+            self.lookup.return_value = None
+            await registration.force_register_member(self.guild, self.member, "NewPlayer")
+            self.assertIsNone(local_repository.get_player(10, 20))
+        self.effects.assert_not_awaited()
+
+    async def test_migration_gate_prevents_api_and_writes(self):
+        self.cutover.return_value = False
+        message = await registration.force_register_member(self.guild, self.member, "NewPlayer")
+        self.assertIn("migration is still pending", message)
+        self.lookup.assert_not_awaited()
+        self.assertIsNone(local_repository.get_player(10, 20))
+
+    async def test_identity_change_during_verification_is_not_overwritten(self):
+        async def lookup(*args):
+            local_repository.register_player(10, 20, "ConcurrentPlayer", "concurrent-id")
+            return self.profile
+
+        self.lookup.side_effect = lookup
+        message = await registration.force_register_member(self.guild, self.member, "NewPlayer")
+        self.assertIn("changed during verification", message)
+        self.assertEqual("ConcurrentPlayer", local_repository.get_player(10, 20).nickname)
+        self.effects.assert_not_awaited()
+
+
+class NamedCharacterLookupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exact_search_is_followed_by_fresh_stable_id_verification(self):
+        with (
+            patch.object(
+                registration.external_io,
+                "run_albion",
+                new=AsyncMock(
+                    return_value={
+                        "Id": "stable-id",
+                        "Name": "Player",
+                        "GuildName": "Stale Guild",
+                    }
+                ),
+            ) as search,
+            patch.object(
+                registration,
+                "_get_player_profile_with_retries",
+                new=AsyncMock(
+                    return_value={
+                        "Id": "stable-id",
+                        "Name": "Player",
+                        "GuildName": "Realm",
+                    }
+                ),
+            ) as verify,
+        ):
+            result = await registration._get_named_player_profile_with_retries("player", "Realm")
+        search.assert_awaited_once_with(albion_api.get_player_by_nickname, "player")
+        verify.assert_awaited_once_with("stable-id", "Realm")
+        self.assertEqual("Realm", result["GuildName"])
+
+    async def test_fuzzy_match_is_rejected(self):
+        with patch.object(
+            registration.external_io,
+            "run_albion",
+            new=AsyncMock(
+                return_value={
+                    "Id": "stable-id",
+                    "Name": "PlayerSimilar",
+                }
+            ),
+        ):
+            with self.assertRaises(albion_api.AlbionResponseError):
+                await registration._get_named_player_profile_with_retries("Player", "Realm")
 
 
 if __name__ == "__main__":

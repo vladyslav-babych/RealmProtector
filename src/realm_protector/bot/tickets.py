@@ -3154,6 +3154,10 @@ async def _freeze_ticket_source(
         return False
     overwrites = dict(getattr(source_channel, "overwrites", {}) or {})
     targets: list[object] = [guild.default_role]
+    archive_record = runtime_state.get_record(_TICKET_RUNTIME_KIND, guild.id, source_channel.id)
+    if archive_record is not None and archive_record.payload.get("workflow_owner") == "trial":
+        # Trial managers have explicit channel grants, which must also be frozen.
+        targets.extend(target for target in overwrites if target != bot_member)
     opener_id = str(metadata.get("opener_id") or "")
     if opener_id.isdigit():
         opener = guild.get_member(int(opener_id))
@@ -3291,7 +3295,8 @@ async def _copy_ticket_to_archive_once(
         source_channel_id=source_channel_id,
     )
     complete_marker = _archive_marker(guild_id, source_channel_id, "complete")
-    legacy_complete = "Archive complete. Deleting ticket channel."
+    source_label = "trial" if metadata.get("panel_id") == "trial" else "ticket"
+    legacy_complete = f"Archive complete. Deleting {source_label} channel."
     if _archive_checkpoint_exists(complete_marker, markers) or legacy_contents[legacy_complete] > 0:
         # Deletion is allowed only after the durable state reflects that the
         # transcript has completed, including recovery from a crash between the
@@ -3469,8 +3474,9 @@ async def _delete_archived_ticket_source(
     metadata: dict[str, str],
     thread=None,
 ) -> bool:
+    source_label = "Trial" if metadata.get("panel_id") == "trial" else "Ticket"
     try:
-        await source_channel.delete(reason="Ticket archived")
+        await source_channel.delete(reason=f"{source_label} archived")
     except discord.NotFound:
         _persist_ticket(source_channel, metadata, status="closed")
         return True
@@ -3482,7 +3488,7 @@ async def _delete_archived_ticket_source(
         )
         if thread is not None:
             await thread.send(
-                "Archive succeeded, but the original ticket channel could not be deleted.",
+                f"Archive succeeded, but the original {source_label.lower()} channel could not be deleted.",
                 allowed_mentions=_NO_MENTIONS,
             )
         return False
@@ -4008,6 +4014,7 @@ async def _archive_is_complete_without_source(
     return bool(
         _archive_checkpoint_exists(complete_marker, markers)
         or legacy_contents["Archive complete. Deleting ticket channel."] > 0
+        or legacy_contents["Archive complete. Deleting trial channel."] > 0
     )
 
 
@@ -4092,6 +4099,62 @@ async def _resume_ticket_archive(
         thread,
     )
     await _delete_archived_ticket_source(source_channel, metadata, thread)
+
+
+async def archive_trial_channel(guild, channel_id: int, payload: dict, bot_user_id: int) -> bool:
+    """Public adapter to the durable transcript engine; the trial reconciler owns retries.
+
+    Never recopy a completed transcript after its recovery markers were cleaned.
+    A missing source without a completed archive is an error, not a successful end.
+    """
+    record = runtime_state.get_record(_TICKET_RUNTIME_KIND, guild.id, channel_id)
+    if record is not None and record.payload.get("workflow_owner") != "trial":
+        raise ValueError("This channel is already owned by another archive workflow.")
+    try:
+        channel = await _fetch_guild_channel(guild, channel_id)
+    except discord.NotFound:
+        channel = None
+    if record is None:
+        if not isinstance(channel, discord.TextChannel):
+            raise ValueError("Trial channel is missing; its transcript cannot be archived.")
+        metadata = {
+            "panel_id": "trial",
+            "opener_id": str(payload["member_id"]),
+            "opener_slug": str(payload["nickname"]),
+            "character": str(payload["nickname"]),
+            "albion_id": "",
+        }
+        _persist_ticket(
+            channel,
+            metadata,
+            status="closing",
+            extra={
+                "workflow_owner": "trial",
+                "archive_channel_id": payload["config"]["archive_channel_id"],
+            },
+        )
+        record = runtime_state.get_record(_TICKET_RUNTIME_KIND, guild.id, channel_id)
+    assert record is not None
+    if record.status == "closed":
+        return True
+    if record.status == "archived_source_remaining":
+        if not _archive_checkpoint_cleanup_is_current(record):
+            await _clean_completed_archive_record(guild, record, bot_user_id)
+        if channel is None:
+            runtime_state.set_status(_TICKET_RUNTIME_KIND, guild.id, channel_id, "closed")
+            return True
+        return await _delete_archived_ticket_source(channel, _metadata_from_ticket_record(record))
+    if channel is None:
+        if await _archive_is_complete_without_source(guild, record, bot_user_id):
+            await _clean_completed_archive_record(guild, record, bot_user_id)
+            runtime_state.set_status(_TICKET_RUNTIME_KIND, guild.id, channel_id, "closed")
+            return True
+        raise ValueError(
+            "Trial source is missing and the archive is incomplete; manual recovery is required."
+        )
+    await _resume_ticket_archive(guild, channel, record, bot_user_id)
+    latest = runtime_state.get_record(_TICKET_RUNTIME_KIND, guild.id, channel_id)
+    return latest is not None and latest.status == "closed"
 
 
 def _ticket_panel_publication_was_committed(
@@ -4328,6 +4391,8 @@ async def reconcile_tickets(bot: discord.Client) -> None:
             except ValueError:
                 continue
             tracked_channel_ids.add(channel_id)
+            if record.payload.get("workflow_owner") == "trial":
+                continue  # Serialized by the trial workflow, including End Trial clicks.
             has_archive_resource = any(
                 record.payload.get(key)
                 for key in (

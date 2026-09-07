@@ -152,26 +152,21 @@ async def _get_player_profile_with_retries(
     return last_profile
 
 
-async def _get_registered_player_profile_with_retries(
-    player: local_repository.PlayerRecord,
+async def _get_named_player_profile_with_retries(
+    nickname: str,
     target_guild_name: str,
 ) -> Optional[dict]:
-    """Recheck a stored registration by stable ID or exact legacy nickname."""
-
-    player_id = str(player.albion_player_id or "").strip()
-    if player_id:
-        return await _get_player_profile_with_retries(player_id, target_guild_name)
+    """Resolve an exact name, then verify a fresh profile by stable Albion ID."""
 
     fallback_delays = (0.0, 0.75, 1.5)
     next_delay = 0.0
-    last_profile: Optional[dict] = None
     for attempt in range(len(fallback_delays)):
         if next_delay:
             await asyncio.sleep(next_delay)
         try:
             profile = await external_io.run_albion(
                 albion_api.get_player_by_nickname,
-                player.nickname,
+                nickname,
             )
         except albion_api.AlbionNotFoundError:
             return None
@@ -192,18 +187,31 @@ async def _get_registered_player_profile_with_retries(
         if not isinstance(profile, dict):
             raise albion_api.AlbionResponseError("Albion player response is invalid.")
         response_name = str(profile.get("Name") or "").strip()
-        if response_name.casefold() != player.nickname.strip().casefold():
+        if response_name.casefold() != nickname.strip().casefold():
             raise albion_api.AlbionResponseError(
                 "Albion returned a profile for a different nickname."
             )
-        last_profile = dict(profile)
+        player_id = str(profile.get("Id") or "").strip()
+        if not player_id:
+            raise albion_api.AlbionResponseError("Albion search returned no player ID.")
+        verified = await _get_player_profile_with_retries(player_id, target_guild_name)
         if (
-            is_in_target_guild(last_profile.get("GuildName"), target_guild_name)
-            or attempt == len(fallback_delays) - 1
+            verified is not None
+            and str(verified.get("Name") or "").strip().casefold() != nickname.casefold()
         ):
-            return last_profile
-        next_delay = fallback_delays[attempt + 1]
-    return last_profile
+            raise albion_api.AlbionResponseError(
+                "Albion returned a profile for a different nickname."
+            )
+        return verified
+    return None
+
+
+def _character_conflict_message(player_name: str) -> str:
+    return (
+        f"Character **{player_name}** is already linked to another Discord account in this server. "
+        "This attempt did not change your registration. An admin must review the existing link; "
+        "it cannot be transferred automatically."
+    )
 
 
 def _intent_external_id(discord_id: int, albion_player_id: str) -> str:
@@ -281,13 +289,32 @@ def _resolve_member_role(
 async def force_register_member(
     guild: discord.Guild,
     member: discord.Member,
+    albionname: str,
+    *,
+    albion_player_id: Optional[str] = None,
+    expected_generation: Optional[int] = None,
+    expected_target_guild_name: Optional[str] = None,
 ) -> str:
-    """Reverify and reactivate one existing local registration without data loss."""
+    """Register or update an admin-selected character without resetting player finances."""
 
+    nickname = albionname.strip()
+    if not nickname or len(nickname) > 40:
+        return "`albionname` must contain 1-40 characters."
+    if getattr(member, "bot", False):
+        return "Bots cannot be registered as Albion players."
     configuration = guild_settings.get_configuration(guild.id)
     if configuration is None:
         return "This server is not configured yet. Run **/bot-setup** first."
-    expected_generation = guild_lifecycle.generation(guild.id)
+    if expected_generation is None:
+        expected_generation = guild_lifecycle.generation(guild.id)
+    if not guild_lifecycle.is_current(guild.id, expected_generation) or (
+        expected_target_guild_name is not None
+        and configuration.target_guild_name.strip().casefold()
+        != expected_target_guild_name.strip().casefold()
+    ):
+        return "The server configuration changed during character selection. Run /force-register again."
+    if not await asyncio.to_thread(google_sync.is_cutover_ready, guild.id):
+        return "The one-time Google Sheet migration is still pending. Try again after it completes."
     ledger_id = await asyncio.to_thread(
         local_repository.get_active_ledger_id,
         guild.id,
@@ -300,14 +327,19 @@ async def force_register_member(
         ledger_id,
         member.id,
     )
-    if player is None:
-        return f"{member.mention} is not registered. Ask them to use **/register** first."
-
     try:
-        profile = await _get_registered_player_profile_with_retries(
-            player,
-            configuration.target_guild_name,
-        )
+        if albion_player_id is not None:
+            if not albion_player_id.strip():
+                return "That character selection is invalid. Run /force-register again."
+            profile = await _get_player_profile_with_retries(
+                albion_player_id.strip(),
+                configuration.target_guild_name,
+            )
+        else:
+            profile = await _get_named_player_profile_with_retries(
+                nickname,
+                configuration.target_guild_name,
+            )
     except albion_api.AlbionAPIError:
         LOGGER.warning(
             "Force registration could not verify user %s in guild %s",
@@ -318,7 +350,7 @@ async def force_register_member(
         return "Albion is temporarily unavailable, so the registration was not changed."
     if profile is None:
         return (
-            f"The stored Albion character **{player.nickname}** could not be found. "
+            f"Albion character **{nickname}** could not be found by exact name. "
             "The registration was not changed."
         )
 
@@ -326,19 +358,22 @@ async def force_register_member(
     if not is_in_target_guild(reported_guild, configuration.target_guild_name):
         location = f"**{reported_guild}**" if reported_guild else "no Albion guild"
         return (
-            f"**{player.nickname}** is currently reported in {location}, not "
+            f"**{nickname}** is currently reported in {location}, not "
             f"**{configuration.target_guild_name}**. The registration was not changed."
         )
 
-    verified_player_id = str(profile.get("Id") or player.albion_player_id or "").strip()
+    verified_player_id = str(profile.get("Id") or "").strip()
+    verified_name = str(profile.get("Name") or "").strip()
+    if not verified_player_id or verified_name.casefold() != nickname.casefold():
+        return "Albion returned an invalid character identity. The registration was not changed."
     external_id = _intent_external_id(
         member.id,
-        verified_player_id or f"nickname:{player.nickname.casefold()}",
+        verified_player_id,
     )
     intent_payload: dict[str, Any] = {
         "discord_user_id": member.id,
         "albion_player_id": verified_player_id,
-        "nickname": player.nickname,
+        "nickname": verified_name,
         "attempts": 0,
         "forced": True,
     }
@@ -373,12 +408,13 @@ async def force_register_member(
                 ledger_id,
                 member.id,
             )
-            if current_player is None:
-                return f"{member.mention} is no longer registered."
-            if (
-                current_player.albion_player_id
-                and player.albion_player_id
-                and current_player.albion_player_id != player.albion_player_id
+            if (current_player is None) != (player is None) or (
+                current_player is not None
+                and player is not None
+                and (
+                    current_player.albion_player_id != player.albion_player_id
+                    or current_player.nickname != player.nickname
+                )
             ):
                 return "The stored Albion registration changed during verification. Run again."
 
@@ -387,15 +423,20 @@ async def force_register_member(
                 local_repository.register_player,
                 ledger_id,
                 member.id,
-                current_player.nickname,
-                verified_player_id or current_player.albion_player_id,
+                verified_name,
+                verified_player_id,
+                replace_character=True,
             )
             if registration_result.status in {
                 local_repository.RegistrationStatus.NICKNAME_CONFLICT,
                 local_repository.RegistrationStatus.ALBION_ID_CONFLICT,
             }:
                 await _delete_side_effect_intent(guild.id, external_id)
-                return "The stored character conflicts with another local registration."
+                owner_id = registration_result.conflicting_discord_user_id
+                return (
+                    f"Character **{verified_name}** is already linked to Discord ID `{owner_id}` in this server. "
+                    "The target member was not changed. Review the existing link before transferring a character."
+                )
             canonical_player = registration_result.player
             if canonical_player is None:
                 raise RuntimeError("Force registration completed without a player record.")
@@ -425,6 +466,8 @@ async def force_register_member(
         f"{member.mention}'s character **{canonical_player.nickname}** was verified in "
         f"**{configuration.target_guild_name}** and is now marked **in guild**."
     )
+    if registration_result.status == local_repository.RegistrationStatus.CREATED:
+        message = f"{member.mention} was registered successfully.\n" + message
     warnings = []
     if not nickname_updated:
         warnings.append("I could not update the Discord nickname.")
@@ -563,7 +606,15 @@ async def register_user(
                 local_repository.RegistrationStatus.ALBION_ID_CONFLICT,
             }:
                 await _delete_side_effect_intent(guild_id, external_id)
-                await context.send(f"Character **{player_name}** is already registered.")
+                LOGGER.warning(
+                    "Registration character conflict in guild %s: requested Discord ID %s, character %s, Albion ID %s, owner Discord ID %s",
+                    guild_id,
+                    discord_id,
+                    player_name,
+                    player_id,
+                    getattr(result, "conflicting_discord_user_id", None),
+                )
+                await context.send(_character_conflict_message(player_name))
                 return
 
             canonical_player = result.player
@@ -594,7 +645,7 @@ async def register_user(
 
     projection = await _project_registered_player_after_commit(guild_id, discord_id)
     if result.status == local_repository.RegistrationStatus.ALREADY_REGISTERED:
-        message = "You are already registered."
+        message = f"Your Discord account is already registered as **{player_name}**."
     elif result.status == local_repository.RegistrationStatus.REACTIVATED:
         message = (
             f"Your registration was updated and **{player_name}** is marked as **in guild** again."

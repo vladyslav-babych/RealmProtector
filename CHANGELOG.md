@@ -6,12 +6,43 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ## [Unreleased]
 
+### Added
+
+- Admin-only `/trial-setup` with a saved seven-step wizard: category, Trial role,
+  multiple Trial Manager roles, archive channel, panel title, panel message and
+  confirmation. Posts a trial configuration panel.
+- `/trial-add @User` for administrators and Trial Managers to start one private
+  trial per registered player. Assigns the Trial role and posts an End Trial panel
+  in an `albionname-trial` channel visible to the player and Trial Managers.
+- SQLite-backed trial recovery and persistent controls. End Trial reuses ticket
+  transcript archiving, deletes the source only after archive completion and
+  retries Trial-role removal. Active trials retain their original configuration.
+
 ### Changed
 
+- `/trial-setup` now follows the Bot Setup and Ticket Panel Setup UI: numbered
+  step titles, emoji instructions, labeled selection previews, step-specific
+  controls, Save and Continue, and Confirm Setup. Trial configuration panels use
+  the same vertical field layout, and long message previews are shown in full.
+- `/force-register` now requires a member and `albionname`. It verifies the exact
+  selected character by stable Albion ID and creates, reactivates or updates the target registration,
+  preserving Silver, all-time earnings and history. Other accounts' character
+  ownership remains protected; new/changed records retain Google outbox retries.
+- `/force-register` now uses the same private three-character stats picker as
+  `/register`, with numbered selection and Cancel buttons. Selection rechecks
+  admin access, target member presence and configuration before registration.
 - Successful registrations and forced re-registrations now immediately add or
   refresh the affected Discord ID in a linked Google Players worksheet after
   SQLite commits. The durable outbox remains the retry path for new and
   reactivated registrations.
+
+### Fixed
+
+- Registration conflict messages now distinguish a character linked to another
+  Discord account in the current server from the caller already having a registration. Conflicts log
+  both Discord IDs for investigation; admin recovery reports the owning ID.
+- Registering a different character no longer attaches its Albion ID to an
+  existing legacy registration's unrelated nickname.
 
 ## [v2.0.2] - 2026-08-26
 

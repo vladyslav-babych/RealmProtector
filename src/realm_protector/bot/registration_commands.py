@@ -82,6 +82,96 @@ class _RegistrationCharacterSelectionView(CharacterSelectionView):
         )
 
 
+class _ForceRegistrationCharacterSelectionView(CharacterSelectionView):
+    """Private admin-owned picker bound to the original server and target member."""
+
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int,
+        member_id: int,
+        target_guild_name: str,
+        expected_generation: int,
+        character_options: list[AlbionCharacterOption],
+    ) -> None:
+        super().__init__(user_id, character_options)
+        self._guild_id = guild_id
+        self._member_id = member_id
+        self._target_guild_name = target_guild_name
+        self._expected_generation = expected_generation
+        self._consumed = False
+
+    async def cancel(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id == self._selection_user_id:
+            if self._consumed:
+                await interaction.response.send_message(
+                    "This selection was already submitted.",
+                    ephemeral=True,
+                )
+                return
+            self._consumed = True
+        await super().cancel(interaction)
+
+    async def on_character_selected(
+        self, interaction: discord.Interaction, selected_character: AlbionCharacterOption
+    ) -> None:
+        if self._consumed:
+            await interaction.response.send_message(
+                "This selection was already submitted.", ephemeral=True
+            )
+            return
+        self._consumed = True
+        self.stop()
+        guild = interaction.guild
+        if (
+            guild is None
+            or guild.id != self._guild_id
+            or not isinstance(interaction.user, discord.Member)
+            or not await is_admin(interaction.user)
+        ):
+            await interaction.response.send_message(
+                "Only the requesting administrator can register this member in the original server.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.edit_message(
+            content=f"Registering <@{self._member_id}> as **{selected_character.nickname}**...",
+            embed=None,
+            view=None,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        try:
+            # Do not register a stale member object if the target left during selection.
+            member = await guild.fetch_member(self._member_id)
+        except discord.NotFound:
+            await interaction.followup.send(
+                "The selected member is no longer in this Discord server.", ephemeral=True
+            )
+            return
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.followup.send(
+                "I could not verify the Discord member. Run /force-register again.", ephemeral=True
+            )
+            return
+        try:
+            message = await registration.force_register_member(
+                guild,
+                member,
+                selected_character.nickname,
+                albion_player_id=selected_character.player_id,
+                expected_generation=self._expected_generation,
+                expected_target_guild_name=self._target_guild_name,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Force registration failed for member %s in guild %s", member.id, guild.id
+            )
+            message = "Failed to update the registration. Try again."
+        await interaction.followup.send(
+            message, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+
 def create_registration_commands(
     bot: "RealmProtectorBot",
 ) -> list[app_commands.Command]:
@@ -255,12 +345,13 @@ def create_registration_commands(
 
     @app_commands.command(
         name="force-register",
-        description="Reverify and reactivate an existing registered member",
+        description="Search and select an Albion character to register or update a member",
     )
     @app_commands.guild_only()
     async def force_register(
         interaction: discord.Interaction,
         member: discord.Member,
+        albionname: str,
     ) -> None:
         guild = interaction.guild
         actor = interaction.user
@@ -277,6 +368,14 @@ def create_registration_commands(
             )
             return
 
+        normalized_name = albionname.strip()
+        if not normalized_name or len(normalized_name) > 40:
+            await interaction.response.send_message(
+                "`albionname` must contain 1-40 characters.",
+                ephemeral=True,
+            )
+            return
+
         retry_after = _FORCE_REGISTRATION_COOLDOWN.claim((guild.id, actor.id))
         if retry_after:
             await interaction.response.send_message(
@@ -286,19 +385,62 @@ def create_registration_commands(
             return
 
         await interaction.response.defer(thinking=True, ephemeral=True)
-        try:
-            message = await registration.force_register_member(guild, member)
-        except Exception:
-            LOGGER.exception(
-                "Force registration failed for member %s in guild %s",
-                member.id,
-                guild.id,
-            )
-            await interaction.followup.send(
-                "Failed to update the registration. Try again.",
-                ephemeral=True,
+        configuration = guild_settings.get_configuration(guild.id)
+        if configuration is None:
+            await interaction.edit_original_response(
+                content="This server is not configured yet. Run /bot-setup first."
             )
             return
-        await interaction.followup.send(message, ephemeral=True)
+        if getattr(member, "bot", False):
+            await interaction.edit_original_response(
+                content="Bots cannot be registered as Albion players."
+            )
+            return
+        if not await asyncio.to_thread(google_sync.is_cutover_ready, guild.id):
+            await interaction.edit_original_response(
+                content="The one-time Google Sheet migration is still pending. Try again after it completes."
+            )
+            return
+        target_guild_name = configuration.target_guild_name
+        expected_generation = guild_lifecycle.generation(guild.id)
+        try:
+            character_options = await albion_characters.search_character_options(
+                normalized_name,
+                raise_on_error=True,
+            )
+        except albion_api.AlbionAPIError:
+            await interaction.edit_original_response(
+                content="Albion is temporarily unavailable. Please try again later."
+            )
+            return
+        if not character_options:
+            await interaction.edit_original_response(
+                content="No characters found. Please check the nickname and try again."
+            )
+            return
+        current_configuration = guild_settings.get_configuration(guild.id)
+        if (
+            current_configuration is None
+            or not guild_lifecycle.is_current(guild.id, expected_generation)
+            or current_configuration.target_guild_name.strip().casefold()
+            != target_guild_name.strip().casefold()
+        ):
+            await interaction.edit_original_response(
+                content="The server configuration changed during character search. Run /force-register again."
+            )
+            return
+        await interaction.edit_original_response(
+            content=f"Select the character to register for {member.mention}.",
+            embed=build_character_selection_embed(character_options),
+            view=_ForceRegistrationCharacterSelectionView(
+                actor.id,
+                guild.id,
+                member.id,
+                target_guild_name,
+                expected_generation,
+                character_options,
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     return [get_participants, register, force_register]

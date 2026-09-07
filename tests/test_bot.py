@@ -26,6 +26,8 @@ EXPECTED_SLASH_COMMANDS = {
     "sync-siphon",
     "sync-status",
     "tickets-setup",
+    "trial-setup",
+    "trial-add",
     "update-config",
 }
 
@@ -40,7 +42,7 @@ EXPECTED_PARAMETERS = {
     "clear": [],
     "get-negative-siphon": [],
     "get-participants": [("battle_ids", True)],
-    "force-register": [("member", True)],
+    "force-register": [("member", True), ("albionname", True)],
     "lootsplit": [
         ("battle_ids", True),
         ("content_name", True),
@@ -57,6 +59,8 @@ EXPECTED_PARAMETERS = {
     "sync-siphon": [],
     "sync-status": [],
     "tickets-setup": [],
+    "trial-setup": [],
+    "trial-add": [("member", True)],
     "update-config": [],
 }
 
@@ -110,6 +114,9 @@ class BotCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
                         "src.realm_protector.bot.client.tickets.register_persistent_views"
                     ) as register_ticket_views,
                     patch(
+                        "src.realm_protector.bot.client.trials.register_persistent_views"
+                    ) as register_trial_views,
+                    patch(
                         "src.realm_protector.bot.client.objectives.register_persistent_views"
                     ) as register_objective_views,
                     patch(
@@ -124,7 +131,7 @@ class BotCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
                     EXPECTED_SLASH_COMMANDS,
                     {command.name for command in bot.tree.get_commands()},
                 )
-                self.assertEqual(21, len(bot.tree.get_commands()))
+                self.assertEqual(23, len(bot.tree.get_commands()))
                 self.assertEqual(
                     EXPECTED_PARAMETERS,
                     {
@@ -141,6 +148,7 @@ class BotCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual("", bot.get_command("bal").signature)
                 self.assertEqual("", bot.get_command("lb").signature)
                 register_ticket_views.assert_called_with(bot)
+                register_trial_views.assert_called_with(bot)
                 register_objective_views.assert_called_with(bot)
                 register_economy_views.assert_called_with(bot)
                 self.assertEqual(1, sync.await_count)
@@ -155,6 +163,7 @@ class BotCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
             bot._background_services_started = True
             bot._startup_notifications_sent = True
             failed_tickets = AsyncMock(side_effect=RuntimeError("ticket failure"))
+            trial_actions = AsyncMock()
             configuration_removals = AsyncMock()
             registrations = AsyncMock()
             configuration_panels = AsyncMock()
@@ -180,6 +189,10 @@ class BotCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
                         new=failed_tickets,
                     ),
                     patch(
+                        "src.realm_protector.bot.client.trials.reconcile_trials",
+                        new=trial_actions,
+                    ),
+                    patch(
                         "src.realm_protector.bot.client.composition.reconcile_compositions",
                         new=compositions,
                     ),
@@ -199,6 +212,7 @@ class BotCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
                 registrations.assert_awaited_once_with(bot)
                 configuration_panels.assert_awaited_once_with(bot)
                 failed_tickets.assert_awaited_once_with(bot)
+                trial_actions.assert_awaited_once_with(bot)
                 compositions.assert_awaited_once_with(bot)
                 reaction_panels.assert_awaited_once_with(bot)
                 objective_actions.assert_awaited_once_with(bot)

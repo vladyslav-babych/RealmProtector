@@ -17,6 +17,7 @@ from src.realm_protector.bot import (
     objectives,
     reaction_roles,
     tickets,
+    trials,
 )
 from src.realm_protector.bot.configuration_commands import (
     create_configuration_commands,
@@ -111,6 +112,7 @@ class RealmProtectorBot(commands.Bot):
             self._application_commands_registered = True
 
         tickets.register_persistent_views(self)
+        trials.register_persistent_views(self)
         objectives.register_persistent_views(self)
         register_economy_persistent_views(self)
         await self._sync_application_commands()
@@ -182,6 +184,7 @@ class RealmProtectorBot(commands.Bot):
                 ),
                 ("configuration panel", configuration_panel.reconcile_configuration_panels),
                 ("tickets", tickets.reconcile_tickets),
+                ("trials", trials.reconcile_trials),
                 ("compositions", composition.reconcile_compositions),
                 (
                     "reaction-role panels",

@@ -34,17 +34,20 @@ class RegistrationCharacterPickerTests(unittest.IsolatedAsyncioTestCase):
         class FakeMember:
             def __init__(self, member_id: int) -> None:
                 self.id = member_id
+                self.mention = f"<@{member_id}>"
 
         actor = FakeMember(404)
         target = FakeMember(405)
         interaction = SimpleNamespace(
-            guild=SimpleNamespace(id=707),
+            guild=SimpleNamespace(id=707, fetch_member=AsyncMock(return_value=target)),
             user=actor,
             response=SimpleNamespace(
                 send_message=AsyncMock(),
                 defer=AsyncMock(),
+                edit_message=AsyncMock(),
             ),
             followup=SimpleNamespace(send=AsyncMock()),
+            edit_original_response=AsyncMock(),
         )
         force_register = next(
             command
@@ -53,6 +56,17 @@ class RegistrationCharacterPickerTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(registration_commands.discord, "Member", FakeMember),
+            patch.object(
+                registration_commands.guild_settings,
+                "get_configuration",
+                return_value=SimpleNamespace(target_guild_name="Realm"),
+            ),
+            patch.object(registration_commands.google_sync, "is_cutover_ready", return_value=True),
+            patch.object(
+                registration_commands.albion_characters,
+                "search_character_options",
+                new=AsyncMock(return_value=_character_options()),
+            ) as search,
             patch.object(
                 registration_commands,
                 "is_admin",
@@ -69,17 +83,31 @@ class RegistrationCharacterPickerTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value="Registration repaired."),
             ) as repair,
         ):
-            await force_register.callback(interaction, target)
+            await force_register.callback(interaction, target, " Player ")
+            repair.assert_not_awaited()
+            search.assert_awaited_once_with("Player", raise_on_error=True)
+            panel = interaction.edit_original_response.await_args.kwargs
+            view = panel["view"]
+            self.assertEqual("Select your character", panel["embed"].title)
+            self.assertEqual(["1", "2", "3", "Cancel"], [button.label for button in view.children])
+            await view.select(interaction, 1)
+            await view.select(interaction, 0)  # Repeated clicks cannot register a second character.
 
         interaction.response.defer.assert_awaited_once_with(
             thinking=True,
             ephemeral=True,
         )
-        repair.assert_awaited_once_with(interaction.guild, target)
-        interaction.followup.send.assert_awaited_once_with(
-            "Registration repaired.",
-            ephemeral=True,
+        repair.assert_awaited_once_with(
+            interaction.guild,
+            target,
+            "Player 2",
+            albion_player_id="player-2",
+            expected_generation=registration_commands.guild_lifecycle.generation(707),
+            expected_target_guild_name="Realm",
         )
+        interaction.guild.fetch_member.assert_awaited_once_with(405)
+        self.assertEqual("Registration repaired.", interaction.followup.send.await_args.args[0])
+        self.assertTrue(interaction.followup.send.await_args.kwargs["ephemeral"])
 
     async def test_force_register_rejects_non_admin(self) -> None:
         class FakeMember:
@@ -111,7 +139,7 @@ class RegistrationCharacterPickerTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(),
             ) as repair,
         ):
-            await force_register.callback(interaction, target)
+            await force_register.callback(interaction, target, "Player")
 
         interaction.response.send_message.assert_awaited_once_with(
             "You don't have permission to use this command.",
@@ -373,6 +401,68 @@ class RegistrationCharacterPickerTests(unittest.IsolatedAsyncioTestCase):
         await context.send("Registered.")
 
         interaction.followup.send.assert_awaited_once_with("Registered.")
+
+
+class ForcePickerSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.actor = SimpleNamespace(id=404)
+        self.guild = SimpleNamespace(id=707, fetch_member=AsyncMock())
+        self.interaction = SimpleNamespace(
+            user=self.actor,
+            guild=self.guild,
+            response=SimpleNamespace(send_message=AsyncMock(), edit_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        self.view = registration_commands._ForceRegistrationCharacterSelectionView(
+            404, 707, 405, "Realm", 0, _character_options()
+        )
+
+    async def test_other_user_cannot_submit_selection(self):
+        self.actor.id = 999
+        await self.view.select(self.interaction, 0)
+        self.guild.fetch_member.assert_not_awaited()
+        self.assertTrue(self.interaction.response.send_message.await_args.kwargs["ephemeral"])
+
+    async def test_cancel_prevents_even_queued_selection_from_registering(self):
+        await self.view.cancel(self.interaction)
+        await self.view.select(self.interaction, 0)
+        self.guild.fetch_member.assert_not_awaited()
+        self.assertEqual(
+            "Cancelled.", self.interaction.response.edit_message.await_args.kwargs["content"]
+        )
+
+    async def test_admin_permission_is_rechecked_on_selection(self):
+        with (
+            patch.object(registration_commands.discord, "Member", SimpleNamespace),
+            patch.object(registration_commands, "is_admin", new=AsyncMock(return_value=False)),
+        ):
+            await self.view.select(self.interaction, 0)
+        self.guild.fetch_member.assert_not_awaited()
+        self.assertIn("administrator", self.interaction.response.send_message.await_args.args[0])
+
+    async def test_member_who_left_is_not_registered(self):
+        error = registration_commands.discord.NotFound(
+            SimpleNamespace(status=404, reason="Not Found"), "gone"
+        )
+        self.guild.fetch_member.side_effect = error
+        with (
+            patch.object(registration_commands.discord, "Member", SimpleNamespace),
+            patch.object(registration_commands, "is_admin", new=AsyncMock(return_value=True)),
+            patch.object(
+                registration_commands.registration, "force_register_member", new=AsyncMock()
+            ) as register,
+        ):
+            await self.view.select(self.interaction, 0)
+        register.assert_not_awaited()
+        self.assertIn(
+            "no longer in this Discord server", self.interaction.followup.send.await_args.args[0]
+        )
+
+    def test_missing_results_disable_numbered_buttons(self):
+        view = registration_commands._ForceRegistrationCharacterSelectionView(
+            404, 707, 405, "Realm", 0, _character_options()[:1]
+        )
+        self.assertEqual([False, True, True, False], [button.disabled for button in view.children])
 
 
 if __name__ == "__main__":
