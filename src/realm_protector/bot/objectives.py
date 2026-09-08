@@ -429,7 +429,11 @@ def _update_objective(guild_id: int, objective: dict) -> None:
 
 
 def _build_panel_embed(guild: discord.Guild) -> discord.Embed:
-    return discord.Embed(title="Active objectives:")
+    entry = _load_guild_entry(guild.id) or {}
+    return discord.Embed(
+        title=str(entry.get("panel_title") or "Active objectives:"),
+        description=str(entry.get("panel_message") or "") or None,
+    )
 
 
 def _format_objective_name(obj: dict) -> str:
@@ -2007,6 +2011,10 @@ async def _post_or_update_objectives_panel_locked(
                         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                             pass
                         return False, "Setup changed while the objectives panel was being updated."
+                    current_entry = _load_guild_entry(guild.id)
+                    if current_entry is not None:
+                        current_entry["destination_channel_id"] = target_channel_id
+                        _save_guild_entry(guild.id, current_entry)
                     return True, "Objectives panel updated."
             except discord.NotFound:
                 pass
@@ -2016,6 +2024,9 @@ async def _post_or_update_objectives_panel_locked(
                 return False, "Failed to update the existing objectives panel."
     if target_channel_id is None:
         return False, "The target channel has no usable Discord ID."
+    current_entry = _guild_entry(_load_guild_entry(guild.id))
+    current_entry["destination_channel_id"] = target_channel_id
+    _save_guild_entry(guild.id, current_entry)
     publication_record = _persist_panel_publication(
         guild.id,
         target_channel_id,
@@ -2081,8 +2092,11 @@ async def handle_set_objectivess_panel(interaction: discord.Interaction) -> None
 
 class ObjectivesPanelView(discord.ui.View):
     def __init__(self):
+        from src.realm_protector.bot.config_editor import UpdateConfigButton
+
         super().__init__(timeout=None)
         self.add_item(_AddObjectiveButton())
+        self.add_item(UpdateConfigButton("objective", "current"))
 
 
 class _AddObjectiveButton(discord.ui.Button):

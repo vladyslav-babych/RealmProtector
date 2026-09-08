@@ -23,6 +23,7 @@ from src.realm_protector.services import authorization, guild_lifecycle
 
 LOGGER = logging.getLogger(__name__)
 NO_MENTIONS = discord.AllowedMentions.none()
+CONFIGURATION_STATUSES = ("active", "publishing")
 
 
 def can_manage(member, configuration: dict) -> bool:
@@ -147,11 +148,32 @@ async def publish_message(channel, record, *, embed, view=None):
 
 
 async def publish_configuration(guild, record):
+    from src.realm_protector.bot.config_editor import ConfigActionsView
+
     channel = await guild.fetch_channel(record.payload["panel_channel_id"])
     if not isinstance(channel, discord.TextChannel):
         raise ValueError("The configuration panel destination must be a text channel.")
-    record = await publish_message(channel, record, embed=configuration_embed(record.payload))
+    record = await publish_message(
+        channel,
+        record,
+        embed=configuration_embed(record.payload),
+        view=ConfigActionsView("trial", "main"),
+    )
     return trial_store.save(record, status="active")
+
+
+def trial_embed(payload: dict) -> discord.Embed:
+    """Render a trial from its durable snapshot without fetching or changing its member."""
+    configuration = payload["config"]
+    embed = discord.Embed(
+        title=configuration["title"],
+        description=configuration["message"],
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="Player", value=f"<@{payload['member_id']}> • {payload['nickname']}", inline=False
+    )
+    return embed
 
 
 async def create_trial(guild, record):
@@ -217,15 +239,9 @@ async def create_trial(guild, record):
         record = trial_store.save(record, channel_id=channel.id)
     if not isinstance(channel, discord.TextChannel):
         raise ValueError("The trial source is not a text channel.")
-    embed = discord.Embed(
-        title=configuration["title"],
-        description=configuration["message"],
-        color=discord.Color.blurple(),
+    record = await publish_message(
+        channel, record, embed=trial_embed(record.payload), view=TrialView()
     )
-    embed.add_field(
-        name="Player", value=f"<@{member.id}> • {record.payload['nickname']}", inline=False
-    )
-    record = await publish_message(channel, record, embed=embed, view=TrialView())
     if channel.topic == f"realm-trial:{record.external_id}":
         await channel.edit(topic="", reason="Trial channel recorded in SQLite")
     return trial_store.save(record, status="active", last_error=None)
@@ -305,7 +321,7 @@ async def handle_trial_add(interaction: discord.Interaction, member: discord.Mem
     await interaction.response.defer(ephemeral=True)
     async with guild_lifecycle.lock_for(guild.id):
         configuration = trial_store.config(guild.id)
-        if configuration is None:
+        if configuration is None or configuration.status not in CONFIGURATION_STATUSES:
             await interaction.followup.send(
                 "An administrator must run /trial-setup first.", ephemeral=True
             )

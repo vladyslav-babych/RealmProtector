@@ -322,30 +322,72 @@ and recovery but are never read by live panels or commands.
 
 ### `/update-config`
 
-Interactive update panel in chat:
+Opens the same **private, administrator-only** editor as **Update Config** on the
+Bot Configuration panel. Ticket, trial, reaction-role, and objectives panels also
+have an Update Config button for their own settings. Ticket/reaction management
+menus include this action for the selected panel.
 
-1. Bot posts an interactive panel in chat
-2. Admin selects the configuration that needs to be updated
-3. Admin enters or selects a new value for the chosen configuration
-4. After confirmation, bot updates SQLite and refreshes the persistent configuration panel
+1. Select the configuration point to change.
+2. Review the current value and a separate new-value preview. Use the role/channel
+   selector or **Set Value** text form; nothing live changes while previewing.
+3. Click **Save Change** to commit to SQLite and refresh associated live panels.
+4. Select another point, or **Done / Cancel** to discard unsaved previews. Earlier
+   saved changes remain saved.
 
-Supported fields:
+Only the administrator who opened the editor can interact with it. Drafts expire
+after 15 minutes; unexpired editors and open text forms can resume after restart.
+Concurrent changes to the same field are rejected until it is reselected; changes
+to unrelated fields are preserved. Long text previews are shortened only for
+Discord's embed limits—the full text is stored and editable in the text form.
+
+Bot/Google Sheets fields:
 
 1. Guild name
 2. Caller role(s)
 3. Economy Manager role(s)
 4. Member role
 5. Leave guild action
-6. Credentials file
-7. Google Sheet name
-8. Players Worksheet name
-9. Lootsplit History Worksheet name
-10. Balance History Worksheet name
+6. Bot updates channel
+7. Credentials file
+8. Google Sheet name
+9. Players Worksheet name
+10. Lootsplit History Worksheet name
+11. Balance History Worksheet name
+
+Feature fields:
+
+- Tickets: panel title, public message, opening ticket message, manager roles,
+  ticket category, archive channel, and public panel destination.
+- Trials: category, Trial role, Trial Manager roles, archive channel, title, and message.
+- Reaction roles: title, message, emoji/role mappings, and destination. Mapping
+  changes do not revoke previously assigned roles or reinterpret old reactions
+  as a new assignment; users react again to opt into the new mapping.
+- Objectives: panel title, introductory message, and destination. Existing
+  objective timers, notification subscriptions, and objective records are preserved.
+
+Ticket/trial text changes update existing live welcome panels, preserving player
+fields, character stats and Close Ticket/End Trial controls. Category, assigned
+role, manager-access and archive changes apply to future tickets/trials; existing
+ones keep their original lifecycle/access settings. Archived conversations are
+never rewritten. Moving a public ticket/reaction/objectives panel uses restart-safe
+publication and disables the previous panel after the replacement is recorded.
+
+Refresh intents are saved before configuration changes. Discord permission/API
+failures retry through the existing recovery loop. Deleted messages are reported
+or skipped without silently recreating them. On startup, buttons are added to
+existing panels whose message IDs are already saved. Historical ticket setup
+summaries and reaction setup home menus whose IDs were never recorded cannot be
+identified safely; use the live panel or its setup management menu instead. New
+configuration summaries have saved message IDs and refresh with their panels.
 
 Safety checks:
 
 - Guild name update is blocked if already used by another server.
+- Changing the Albion guild is not a cosmetic rename: it archives the previous
+  local ledger and quarantines the old Google Sheets link. The editor warns before saving.
 - Credentials file update requires the file to exist in `google_sheet_credentials/`.
+- Google Sheets remains optional. Link it first before editing its settings;
+  credential files remain isolated by Discord server.
 
 ## Guild membership tracking
 
@@ -752,6 +794,37 @@ Discord interaction tokens expire; the user can safely run those dialogs again.
 Completed Discord artifacts do not retain checkpoint text, footer IDs, or role-name
 suffixes. A short-lived non-rendered token covers only the send-before-ID commit
 window; restart reconciliation removes it and any visible markers from older releases.
+
+### One-time JimmyCoacaza registration repair
+
+Deploy the updated code and restart the bot normally; **do not replace the hosting
+database with a local copy**. Storage initialization automatically runs the known
+TEAM CASUALTY repair before Discord or background workers start. It changes only
+JimmyCoacaza's incorrectly stored Albion ID, freeing Mamaliga's character ID for
+registration. The repair does not automatically register Mamaliga or transfer
+balances between Discord accounts.
+
+The repair requires the exact original active ledger, Discord account, nickname
+and incorrect ID, and refuses to take a correct ID already linked to somebody
+else. It preserves all other player columns, balance history and Google outbox
+records. Before/after row snapshots and a completion marker are committed with
+the correction in `runtime_records` under `startup_data_repair`. Subsequent
+restarts skip the completed repair. Changed/conflicting records produce a blocked
+audit entry and a startup-log error instead of being overwritten.
+
+Look for `Startup data repair 2026-09-08-jimmycoacaza-character-id applied` in the
+hosting startup/console log, then retry `/force-register` for Mamaliga and Discord
+user `936012266321608744` using the normal character-selection flow.
+
+Optional read-only preview (not needed for the automatic restart repair):
+
+```bash
+python scripts/repair_registration_links.py
+```
+
+The utility honors `.env` / `REALM_PROTECTOR_DATABASE_PATH`, `--database PATH`, and
+`--project-root PATH`. Passing `--apply` performs the repair immediately; stop the
+bot before using that option. Keep a current hosting database backup as usual.
 
 ## Notes
 

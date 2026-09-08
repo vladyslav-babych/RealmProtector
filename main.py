@@ -15,6 +15,7 @@ from src.realm_protector.infrastructure import (
     guild_settings,
     local_repository,
     sqlite_database,
+    startup_repairs,
 )
 from src.realm_protector.infrastructure.credential_store import (
     harden_existing_credential_permissions,
@@ -46,6 +47,7 @@ def initialize_local_storage(project_root: Path = PROJECT_ROOT) -> LegacyMigrati
         failed_sources = ", ".join(source.source_path for source in report.sources if source.failed)
         raise RuntimeError("Legacy storage migration failed for: " + failed_sources)
     guild_settings.reconcile_ledger_generations()
+    startup_repairs.run_startup_repairs(configured_path)
     return report
 
 

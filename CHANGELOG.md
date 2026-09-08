@@ -8,6 +8,12 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ### Added
 
+- Persistent **Update Config** controls for bot/Google Sheets, ticket, trial,
+  reaction-role, and objectives configuration. Private administrator-only editors
+  provide field selection, current/new previews, explicit saving and cancellation.
+- SQLite-backed editing drafts, restart-restorable text forms, conflict detection,
+  and durable associated-panel refresh retries. New ticket/reaction configuration
+  summaries retain their message IDs so they can be updated in place.
 - Admin-only `/trial-setup` with a saved seven-step wizard: category, Trial role,
   multiple Trial Manager roles, archive channel, panel title, panel message and
   confirmation. Posts a trial configuration panel.
@@ -20,6 +26,13 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ### Changed
 
+- Ticket/trial title and welcome-message changes refresh existing live panels;
+  character stats, player fields, archive history and existing lifecycle/access
+  settings are preserved. Category/role/archive changes affect future tickets/trials.
+- Reaction-role panels support safe mapping edits and destination moves; objectives
+  panels support editable title, message and destination without altering timers.
+- `/update-config` now uses the shared private editor and includes the bot updates
+  channel. The public bot configuration also displays its leave-guild action.
 - `/trial-setup` now follows the Bot Setup and Ticket Panel Setup UI: numbered
   step titles, emoji instructions, labeled selection previews, step-specific
   controls, Save and Continue, and Confirm Setup. Trial configuration panels use
@@ -38,6 +51,15 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ### Fixed
 
+- One-time, audited startup repair for the known JimmyCoacaza/Mamaliga character-ID
+  mismatch in the original TEAM CASUALTY ledger. Only the exact affected account's
+  Albion ID is corrected; balances, earnings, membership, Siphon and history remain
+  unchanged. Conflicting or changed records are left untouched. Added an optional
+  `scripts/repair_registration_links.py` preview/manual-repair utility.
+- Configuration editors recheck administrator access, ownership and current saved
+  state before committing. Deleted panels do not cause perpetual refresh retries,
+  and removed server setups retire trial configuration and pending editors while
+  preserving existing trial conversations for safe closure.
 - Registration conflict messages now distinguish a character linked to another
   Discord account in the current server from the caller already having a registration. Conflicts log
   both Discord IDs for investigation; admin recovery reports the owning ID.

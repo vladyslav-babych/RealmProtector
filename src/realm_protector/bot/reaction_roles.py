@@ -12,7 +12,7 @@ from src.realm_protector.infrastructure import (
     guild_settings,
     runtime_state,
 )
-from src.realm_protector.services import authorization, role_security
+from src.realm_protector.services import authorization, guild_lifecycle, role_security
 from src.realm_protector.services.keyed_locks import KeyedLockPool
 
 _MAX_REACTIONS_PER_PANEL = 6
@@ -174,6 +174,7 @@ async def deactivate_guild_reaction_role_configuration(
                     await message.edit(
                         content="This reaction-role panel has been disabled.",
                         embed=None,
+                        view=None,
                     )
             except discord.NotFound:
                 continue
@@ -272,6 +273,27 @@ def _build_panel_embed(
     if reactions:
         description += "\n\n" + _format_role_reaction_list(guild, reactions)
     return discord.Embed(title=panel_name, description=description)
+
+
+def _build_configuration_embed(guild: discord.Guild, panel: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="Reaction-role configuration",
+        description=str(panel.get("panel_message") or ""),
+    )
+    embed.add_field(name="Panel title", value=str(panel.get("panel_name") or "Roles"), inline=False)
+    embed.add_field(
+        name="Role reactions",
+        value=_format_role_reaction_list(guild, panel.get("reactions", [])),
+        inline=False,
+    )
+    embed.add_field(
+        name="Panel channel",
+        value=_format_channel_mention(
+            guild, panel.get("destination_channel_id") or panel.get("panel_channel_id")
+        ),
+        inline=False,
+    )
+    return embed
 
 
 def _publish_marker(operation_id: str) -> str:
@@ -440,6 +462,8 @@ async def _post_pending_panel(
     reactions are added only after its message ID has been durably recorded.
     """
 
+    from src.realm_protector.bot.config_editor import ConfigActionsView
+
     operation_id = uuid4().hex
     try:
         _record_publish(
@@ -480,6 +504,7 @@ async def _post_pending_panel(
                 guild,
                 panel.get("reactions") or [],
             ),
+            view=ConfigActionsView("reaction", "current"),
         )
         for item in panel.get("reactions") or []:
             if not await _add_panel_reaction(
@@ -683,6 +708,7 @@ async def _disable_previous_reaction_panel_message(
         await message.edit(
             content="This reaction-role panel has been replaced and is no longer active.",
             embed=None,
+            view=None,
         )
     except discord.NotFound:
         return True
@@ -1171,6 +1197,8 @@ class _ConfirmAndSendButton(discord.ui.Button):
         super().__init__(label="Confirm and Send Panel", style=discord.ButtonStyle.success)
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        from src.realm_protector.bot.config_editor import ConfigActionsView
+
         view = self.view
         if not isinstance(view, RoleReactionSetupView):
             return
@@ -1239,6 +1267,9 @@ class _ConfirmAndSendButton(discord.ui.Button):
             "reactions": reactions,
             "destination_channel_id": int(state.get("destination_channel_id") or 0),
         }
+        if interaction.message is not None:
+            panel["configuration_channel_id"] = int(interaction.message.channel.id)
+            panel["configuration_message_id"] = int(interaction.message.id)
         try:
             panel_message, publish_operation_id = await _post_pending_panel(
                 view.guild,
@@ -1315,10 +1346,13 @@ class _ConfirmAndSendButton(discord.ui.Button):
             return
         _finish_publish(view.guild.id, publish_operation_id)
 
-        home_view = RoleReactionHomeView(view.user_id, view.guild)
         if interaction.message is not None:
             try:
-                await interaction.message.edit(embed=_build_home_embed(view.guild), view=home_view)
+                await interaction.message.edit(
+                    embed=_build_configuration_embed(view.guild, panel),
+                    view=ConfigActionsView("reaction", "current"),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             except discord.HTTPException:
                 pass
 
@@ -1390,6 +1424,8 @@ class ManagePanelsView(discord.ui.View):
         return _get_panel_by_id(self.guild.id, str(self.selected_panel_id))
 
     def _build_items(self) -> None:
+        from src.realm_protector.bot.config_editor import UpdateConfigButton
+
         self.clear_items()
         if self.panels:
             visible = self._visible_panels()
@@ -1398,6 +1434,8 @@ class ManagePanelsView(discord.ui.View):
             self.add_item(_ManagePanelSelect(visible, self.selected_panel_id))
             self.add_item(_SendPanelAgainButton())
             self.add_item(_DeletePanelButton())
+            if self.selected_panel_id:
+                self.add_item(UpdateConfigButton("reaction", self.selected_panel_id))
             if self.page_count > 1:
                 self.add_item(_PreviousPanelsPageButton(disabled=self.page <= 0))
                 self.add_item(_NextPanelsPageButton(disabled=self.page >= self.page_count - 1))
@@ -1739,6 +1777,46 @@ def _panel_assignment_version(panel: dict) -> str:
     return hashlib.sha256(repr(material).encode("utf-8")).hexdigest()
 
 
+def _reaction_reset_pending(panel: dict, emoji_str: str) -> bool:
+    return any(
+        _emoji_matches(str(pending), emoji_str)
+        for pending in panel.get("pending_reaction_resets", [])
+    )
+
+
+def _track_mapping_member(
+    guild_id: int,
+    panel_id: str,
+    emoji_str: str,
+    role_id: int,
+    member_id: int,
+    *,
+    desired: bool,
+) -> None:
+    """Keep remapped panels from taking ownership of pre-existing member roles."""
+
+    panel = _get_panel_by_id(guild_id, panel_id)
+    if panel is None:
+        return
+    for mapping in panel.get("reactions", []):
+        if (
+            not _emoji_matches(str(mapping.get("emoji") or ""), emoji_str)
+            or int(mapping.get("role_id") or 0) != role_id
+            or "tracked_member_ids" not in mapping
+        ):
+            continue
+        members = {int(value) for value in mapping.get("tracked_member_ids", [])}
+        previous = set(members)
+        if desired:
+            members.add(member_id)
+        else:
+            members.discard(member_id)
+        if members != previous:
+            mapping["tracked_member_ids"] = sorted(members)
+            _save_panel(guild_id, panel)
+        return
+
+
 async def _apply_member_role_state(
     member,
     role,
@@ -1761,6 +1839,11 @@ async def _apply_member_role_state(
 async def _reconcile_reaction_assignments_for_guild(guild: discord.Guild) -> None:
     """Repair reaction/role drift that happened while the bot was offline."""
 
+    async with guild_lifecycle.lock_for(guild.id):
+        await _reconcile_reaction_assignments_locked(guild)
+
+
+async def _reconcile_reaction_assignments_locked(guild: discord.Guild) -> None:
     if not guild_settings.get_target_guild(guild.id):
         return
     active_cache_keys: set[tuple[int, int]] = set()
@@ -1788,6 +1871,9 @@ async def _reconcile_reaction_assignments_for_guild(guild: discord.Guild) -> Non
         panel_succeeded = True
         for mapping in panel.get("reactions", []) or []:
             if not isinstance(mapping, dict):
+                continue
+            if _reaction_reset_pending(panel, str(mapping.get("emoji") or "")):
+                panel_succeeded = False
                 continue
             role = guild.get_role(int(mapping.get("role_id") or 0))
             if role_security.self_assignment_error(role, guild):
@@ -1832,12 +1918,37 @@ async def _reconcile_reaction_assignments_for_guild(guild: discord.Guild) -> Non
             for member in desired_members.values():
                 if not await _apply_member_role_state(member, role, desired=True):
                     panel_succeeded = False
+                elif "tracked_member_ids" in mapping:
+                    _track_mapping_member(
+                        guild.id,
+                        str(panel["id"]),
+                        str(mapping["emoji"]),
+                        int(mapping["role_id"]),
+                        member.id,
+                        desired=True,
+                    )
             if reaction_is_complete:
+                tracked = (
+                    {int(value) for value in mapping.get("tracked_member_ids", [])}
+                    if "tracked_member_ids" in mapping
+                    else None
+                )
                 for member in tuple(getattr(role, "members", ()) or ()):
                     if getattr(member, "bot", False) or int(member.id) in desired_members:
                         continue
+                    if tracked is not None and int(member.id) not in tracked:
+                        continue
                     if not await _apply_member_role_state(member, role, desired=False):
                         panel_succeeded = False
+                    elif tracked is not None:
+                        _track_mapping_member(
+                            guild.id,
+                            str(panel["id"]),
+                            str(mapping["emoji"]),
+                            int(mapping["role_id"]),
+                            member.id,
+                            desired=False,
+                        )
         if panel_succeeded:
             _offline_reconciled_panel_versions[cache_key] = version
 
@@ -1854,11 +1965,21 @@ async def _handle_raw_reaction_role_event(
 ) -> None:
     if payload.guild_id is None or payload.user_id == getattr(bot.user, "id", None):
         return
+    async with guild_lifecycle.lock_for(payload.guild_id):
+        await _handle_raw_reaction_role_event_locked(bot, payload, desired=desired)
+
+
+async def _handle_raw_reaction_role_event_locked(
+    bot,
+    payload: discord.RawReactionActionEvent,
+    *,
+    desired: bool,
+) -> None:
     guild = bot.get_guild(payload.guild_id)
     if guild is None or not guild_settings.get_target_guild(guild.id):
         return
     panel = _get_panel_by_message_id(guild.id, payload.message_id)
-    if panel is None:
+    if panel is None or _reaction_reset_pending(panel, str(payload.emoji)):
         return
     matching_role_id = _find_role_id_for_emoji(
         panel.get("reactions", []),
@@ -1879,6 +2000,7 @@ async def _handle_raw_reaction_role_event(
         fresh_panel = _get_panel_by_message_id(guild.id, payload.message_id)
         if (
             fresh_panel is None
+            or _reaction_reset_pending(fresh_panel, str(payload.emoji))
             or _find_role_id_for_emoji(
                 fresh_panel.get("reactions", []),
                 str(payload.emoji),
@@ -1900,6 +2022,23 @@ async def _handle_raw_reaction_role_event(
                 await member.add_roles(role, reason="Role reaction panel")
             else:
                 await member.remove_roles(role, reason="Role reaction panel")
+            mapping: dict = next(
+                (
+                    item
+                    for item in fresh_panel.get("reactions", [])
+                    if _emoji_matches(str(item.get("emoji") or ""), str(payload.emoji))
+                ),
+                {},
+            )
+            if "tracked_member_ids" in mapping:
+                _track_mapping_member(
+                    guild.id,
+                    str(fresh_panel["id"]),
+                    str(payload.emoji),
+                    matching_role_id,
+                    payload.user_id,
+                    desired=desired,
+                )
         except (discord.Forbidden, discord.HTTPException) as err:
             logging.warning(
                 "Could not %s role %s for member %s: %s",
