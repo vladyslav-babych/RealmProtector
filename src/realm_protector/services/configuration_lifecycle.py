@@ -81,6 +81,13 @@ def begin_guild_configuration_removal(
             "guild_configuration_removed",
             database=database,
         )
+        # Keep active trial conversations endable, but retire old configuration
+        # and editing surfaces so rerunning bot setup cannot reactivate them.
+        database.execute(
+            "UPDATE runtime_records SET status = 'disabled', updated_at = CURRENT_TIMESTAMP "
+            "WHERE guild_id = ? AND kind IN ('trial_configuration', 'trial_setup', 'configuration_edit_draft')",
+            (discord_server_id,),
+        )
         removed = guild_settings.remove_target_guild_in_transaction(
             database,
             discord_server_id,

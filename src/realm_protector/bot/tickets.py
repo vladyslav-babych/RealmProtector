@@ -24,6 +24,7 @@ from src.realm_protector.bot.character_picker import (
     build_character_selection_embed,
 )
 from src.realm_protector.bot.common import allowed_user_mentions
+from src.realm_protector.bot.config_editor import UpdateConfigButton
 from src.realm_protector.infrastructure import (
     document_store,
     guild_settings,
@@ -381,6 +382,10 @@ async def _disable_previous_ticket_panel_message(
         if not isinstance(channel, discord.TextChannel):
             return False
         message = await channel.fetch_message(message_id)
+        if not _message_is_bot_authored(
+            message, int(getattr(getattr(guild, "me", None), "id", 0) or 0)
+        ):
+            return False
         await message.edit(
             content="This ticket panel has been replaced and is no longer active.",
             embed=None,
@@ -540,6 +545,33 @@ def _save_panel(guild_id: int, panel: dict) -> None:
     panels = entry.setdefault("panels", {})
     panels[str(panel["id"])] = panel
     _save_ticket_entry(guild_id, entry)
+
+
+def _ticket_lifecycle_snapshot(panel: dict) -> dict:
+    """Keep existing conversations' access and closing destinations stable."""
+
+    return {
+        key: list(value) if isinstance(value, list) else value
+        for key in (
+            "management_role_ids",
+            "ticket_category_id",
+            "ticket_archive_channel_id",
+            "closed_ticket_category_id",
+        )
+        if (value := panel.get(key)) is not None
+    }
+
+
+def _panel_for_existing_ticket(guild_id: int, channel_id: int, panel: dict) -> dict:
+    record = runtime_state.get_record(_TICKET_RUNTIME_KIND, guild_id, channel_id)
+    snapshot = record.payload.get("lifecycle_config") if record is not None else None
+    if not isinstance(snapshot, dict):
+        return panel
+    result = dict(panel)
+    for field in _ticket_lifecycle_snapshot(panel):
+        result.pop(field, None)
+    result.update(snapshot)
+    return result
 
 
 def _delete_panel(guild_id: int, panel_id: str) -> None:
@@ -901,7 +933,7 @@ def _build_manage_embed(
     if selected_panel is None:
         selected_panel = panels[0]
 
-    embed.description = "Select a panel to resend or delete it."
+    embed.description = "Select a panel to update its configuration, resend, or delete it."
     embed.add_field(
         name="Panel name", value=selected_panel.get("panel_name", "Unknown"), inline=False
     )
@@ -962,6 +994,13 @@ def _build_manage_embed(
         value=_format_channel_mention(guild, selected_panel.get("panel_channel_id")),
         inline=False,
     )
+    return embed
+
+
+def _build_ticket_config_embed(guild: discord.Guild, panel: dict) -> discord.Embed:
+    embed = _build_manage_embed(guild, [panel], str(panel["id"]))
+    embed.title = "Ticket configuration"
+    embed.description = "Use Update Config to privately preview and save changes."
     return embed
 
 
@@ -1388,6 +1427,8 @@ class FinishPanelButton(discord.ui.Button):
             "ticket_message": view.state["ticket_message"],
             "panel_channel_id": 0,
             "panel_message_id": 0,
+            "config_channel_id": int(interaction.channel_id or 0),
+            "config_message_id": int(interaction.message.id if interaction.message else 0),
             "active": True,
         }
         try:
@@ -1448,13 +1489,12 @@ class FinishPanelButton(discord.ui.Button):
             return
         _finish_panel_publish(view.guild.id, publish_operation_id)
 
+        completed_view = TicketsSetupHomeView(view.bot, view.user_id, view.guild)
+        completed_view.add_item(UpdateConfigButton("ticket", key=panel_id))
         await _edit_component_message(
             interaction,
-            embed=discord.Embed(
-                title="Ticket panel created",
-                description=f"Panel **{panel['panel_name']}** was posted in {panel_destination_channel.mention}.",
-            ),
-            view=TicketsSetupHomeView(view.bot, view.user_id, view.guild),
+            embed=_build_ticket_config_embed(view.guild, panel),
+            view=completed_view,
         )
 
 
@@ -1552,6 +1592,8 @@ class ManagePanelsView(discord.ui.View):
             self.add_item(ManagePanelSelect(visible, self.selected_panel_id))
             self.add_item(ResendPanelButton())
             self.add_item(DeletePanelButton())
+            if self.selected_panel_id:
+                self.add_item(UpdateConfigButton("ticket", key=str(self.selected_panel_id)))
             if self.page_count > 1:
                 self.add_item(ManagePreviousPageButton(disabled=self.page <= 0))
                 self.add_item(ManageNextPageButton(disabled=self.page >= self.page_count - 1))
@@ -1847,6 +1889,7 @@ class TicketOpenView(discord.ui.View):
     def __init__(self, bot):
         super().__init__(timeout=None)
         self.bot = bot
+        self.add_item(UpdateConfigButton("ticket", key="current"))
 
     @discord.ui.button(
         label="Open Ticket", style=discord.ButtonStyle.success, custom_id="tickets:open"
@@ -2198,7 +2241,11 @@ async def _complete_ticket_creation_locked(
             status="creating",
             stats=dict(payload.get("character_stats") or {}),
             pve_total=int(payload.get("pve_total") or 0),
-            extra={"creation_id": operation_id},
+            extra={
+                "creation_id": operation_id,
+                "lifecycle_config": payload.get("lifecycle_config")
+                or _ticket_lifecycle_snapshot(panel),
+            },
         )
 
         control = await _find_ticket_creation_message(
@@ -2221,7 +2268,10 @@ async def _complete_ticket_creation_locked(
             )
             control_embed.add_field(
                 name="Management team",
-                value=_format_role_names(guild, panel.get("management_role_ids", [])),
+                value=_format_role_names(
+                    guild,
+                    (payload.get("lifecycle_config") or panel).get("management_role_ids", []),
+                ),
                 inline=False,
             )
             control = await channel.send(
@@ -2279,7 +2329,13 @@ async def _complete_ticket_creation_locked(
             status="open",
             stats=dict(payload.get("character_stats") or {}),
             pve_total=int(payload.get("pve_total") or 0),
-            extra={"creation_id": operation_id},
+            extra={
+                "creation_id": operation_id,
+                "control_message_id": int(control.id),
+                "stats_message_id": int(stats_message.id),
+                "lifecycle_config": payload.get("lifecycle_config")
+                or _ticket_lifecycle_snapshot(panel),
+            },
         )
         payload["discord_checkpoints_removed"] = False
         _persist_ticket_creation(
@@ -2552,6 +2608,7 @@ async def _create_confirmed_ticket(
         "albion_id": str(albion_id or ""),
         "category_id": int(category.id),
         "management_role_ids": [int(role.id) for role in management_roles],
+        "lifecycle_config": _ticket_lifecycle_snapshot(panel),
         "channel_name": ticket_name,
         "topic": topic,
         "character_stats": dict(search_profile),
@@ -3795,6 +3852,8 @@ class TicketCloseView(discord.ui.View):
             )
             return
 
+        panel = _panel_for_existing_ticket(interaction.guild.id, interaction.channel.id, panel)
+
         if not _has_management_access(interaction.user, panel.get("management_role_ids", [])):
             await interaction.response.send_message(
                 "Only the management team can close this ticket.", ephemeral=True
@@ -3824,6 +3883,9 @@ class TicketCloseView(discord.ui.View):
                     "Ticket configuration was not found.",
                 )
                 return
+            fresh_panel = _panel_for_existing_ticket(
+                interaction.guild.id, interaction.channel.id, fresh_panel
+            )
             if not _has_management_access(
                 interaction.user,
                 fresh_panel.get("management_role_ids", []),

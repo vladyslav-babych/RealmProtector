@@ -11,6 +11,7 @@ from discord.ext import commands
 
 from src.realm_protector.bot import (
     composition,
+    config_editor,
     configuration_panel,
     configuration_remove,
     message_triggers,
@@ -115,6 +116,7 @@ class RealmProtectorBot(commands.Bot):
         trials.register_persistent_views(self)
         objectives.register_persistent_views(self)
         register_economy_persistent_views(self)
+        config_editor.register_persistent_views(self)
         await self._sync_application_commands()
 
     async def _sync_application_commands(self) -> bool:
@@ -191,6 +193,7 @@ class RealmProtectorBot(commands.Bot):
                     reaction_roles.reconcile_reaction_role_panels,
                 ),
                 ("objective actions", objectives.reconcile_objective_actions),
+                ("configuration updates", config_editor.reconcile_configuration_updates),
             )
             for workflow_name, reconcile in reconcilers:
                 try:

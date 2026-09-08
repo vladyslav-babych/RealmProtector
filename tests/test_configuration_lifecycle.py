@@ -6,6 +6,7 @@ from src.realm_protector.infrastructure import (
     document_store,
     guild_settings,
     local_repository,
+    runtime_state,
     sqlite_database,
 )
 from src.realm_protector.services import configuration_lifecycle
@@ -85,6 +86,17 @@ class ConfigurationLifecycleTests(unittest.TestCase):
         self.assertEqual("King's Blood", guild_settings.get_target_guild(10))
         self.assertIsNotNone(local_repository.get_active_ledger(10))
         self.assertIsNone(configuration_lifecycle.get_pending_removal(10))
+
+    def test_removal_retires_editors_but_keeps_trial_conversations_endable(self) -> None:
+        guild_settings.set_target_guild(10, "King's Blood")
+        for kind in ("trial_configuration", "trial_setup", "configuration_edit_draft", "trial"):
+            runtime_state.upsert_record(kind, 10, "main", {"member_id": 20})
+            runtime_state.upsert_record(kind, 11, "main", {"member_id": 21})
+        configuration_lifecycle.begin_guild_configuration_removal(10)
+        for kind in ("trial_configuration", "trial_setup", "configuration_edit_draft"):
+            self.assertEqual("disabled", runtime_state.get_record(kind, 10, "main").status)
+            self.assertEqual("active", runtime_state.get_record(kind, 11, "main").status)
+        self.assertEqual("active", runtime_state.get_record("trial", 10, "main").status)
 
 
 if __name__ == "__main__":

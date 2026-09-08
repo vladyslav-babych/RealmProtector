@@ -5,14 +5,11 @@ from typing import TYPE_CHECKING
 import discord
 from discord import app_commands
 
+from src.realm_protector.bot.config_editor import open_editor
 from src.realm_protector.bot.configuration_remove import handle_bot_remove_slash
 from src.realm_protector.bot.configuration_setup import (
     BotSetupStepView,
     _build_bot_setup_step_embed,
-)
-from src.realm_protector.bot.configuration_update import (
-    UpdateConfigView,
-    _build_update_config_embed,
 )
 from src.realm_protector.bot.google_sheet_link import (
     GoogleSheetLinkStepView,
@@ -97,12 +94,7 @@ def create_configuration_commands(
             )
             return
 
-        update_view = UpdateConfigView(interaction.guild, interaction.user.id)
-        await interaction.response.send_message(
-            embed=_build_update_config_embed(update_view),
-            view=update_view,
-        )
-        update_view.host_message = await interaction.original_response()
+        await open_editor(interaction, "bot")
 
     @app_commands.command(
         name="bot-remove",

@@ -7,6 +7,7 @@ from typing import Tuple
 import discord
 
 from src.realm_protector.bot import message_checkpoints
+from src.realm_protector.bot.config_editor import ConfigActionsView
 from src.realm_protector.infrastructure import credential_store, guild_settings, runtime_state
 from src.realm_protector.services import guild_lifecycle
 
@@ -117,6 +118,17 @@ def _build_bot_configuration_panel(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="Caller role(s)", value=caller_roles, inline=False)
     embed.add_field(name="Economy Manager role(s)", value=economy_manager_roles, inline=False)
     embed.add_field(name="Member role", value=member_role, inline=False)
+    leave_action = getattr(configuration, "leave_action", None)
+    leave_action_value = getattr(leave_action, "value", leave_action)
+    embed.add_field(
+        name="Leave guild action",
+        value={
+            "kick": "Kick from server",
+            "remove_roles": "Remove all roles",
+            "none": "Do nothing",
+        }.get(str(leave_action_value or ""), not_configured),
+        inline=False,
+    )
     embed.add_field(name="Bot updates channel", value=bot_updates_channel, inline=False)
     embed.add_field(name="Credentials file", value=credentials_file, inline=False)
     embed.add_field(name="Google Sheet name", value=google_sheet_name, inline=False)
@@ -279,6 +291,7 @@ async def _complete_publication(
             message = await channel.send(
                 content=message_checkpoints.content_with_checkpoint(None, marker),
                 embed=_build_bot_configuration_panel(guild),
+                view=ConfigActionsView("bot"),
                 nonce=message_checkpoints.stable_nonce(marker),
             )
         record = _persist_publication(
@@ -292,6 +305,7 @@ async def _complete_publication(
             await message.edit(
                 content=None,
                 embed=_build_bot_configuration_panel(guild),
+                view=ConfigActionsView("bot"),
             )
         record = _persist_publication(
             guild.id,
@@ -428,7 +442,7 @@ async def _post_or_update_bot_configuration_message_locked(
                 existing_message,
                 _publication_marker(interaction.guild.id),
             )
-            await existing_message.edit(content=None, embed=embed)
+            await existing_message.edit(content=None, embed=embed, view=ConfigActionsView("bot"))
             try:
                 _persist_publication(
                     interaction.guild.id,
