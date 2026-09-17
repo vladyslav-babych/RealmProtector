@@ -1619,9 +1619,7 @@ def register_player(
                 """
                 UPDATE registered_players
                 SET nickname = ?, nickname_key = ?, albion_player_id = ?,
-                    is_active = 1, revision = revision + 1,
-                    siphon = NULL, siphon_revision = NULL,
-                    siphon_synced_at = NULL, updated_at = ?
+                    is_active = 1, revision = revision + 1, updated_at = ?
                 WHERE guild_id = ? AND discord_user_id = ?
                 """,
                 (
@@ -1920,9 +1918,7 @@ def set_in_guild(
         connection.execute(
             """
             UPDATE registered_players
-            SET is_active = ?, revision = revision + 1,
-                siphon = NULL, siphon_revision = NULL,
-                siphon_synced_at = NULL, updated_at = ?
+            SET is_active = ?, revision = revision + 1, updated_at = ?
             WHERE guild_id = ? AND discord_user_id = ?
             """,
             (active_value, now, guild_id, discord_user_id),
@@ -1983,7 +1979,7 @@ def change_balance(
     occurred_at: Optional[str | datetime] = None,
     database_path: DatabasePath = None,
 ) -> Optional[BalanceChangeResult]:
-    """Atomically change Silver, clamp it at zero, and append audit/outbox rows."""
+    """Change Silver and append audit/outbox rows, preserving the last Siphon sync."""
 
     _validate_identifier(guild_id, "guild_id")
     _validate_identifier(discord_user_id, "discord_user_id")
@@ -2037,22 +2033,12 @@ def change_balance(
             """
             UPDATE registered_players
             SET silver = ?, all_time_earnings = ?, revision = revision + ?,
-                siphon = CASE WHEN ? = 1 THEN NULL ELSE siphon END,
-                siphon_revision = CASE
-                    WHEN ? = 1 THEN NULL ELSE siphon_revision
-                END,
-                siphon_synced_at = CASE
-                    WHEN ? = 1 THEN NULL ELSE siphon_synced_at
-                END,
                 updated_at = ?
             WHERE guild_id = ? AND discord_user_id = ?
             """,
             (
                 updated,
                 all_time_earnings,
-                revision_increment,
-                revision_increment,
-                revision_increment,
                 revision_increment,
                 now,
                 guild_id,
@@ -2304,13 +2290,6 @@ def apply_lootsplit(
                 """
                 UPDATE registered_players
                 SET silver = ?, all_time_earnings = ?, revision = ?,
-                    siphon = CASE WHEN ? = 1 THEN NULL ELSE siphon END,
-                    siphon_revision = CASE
-                        WHEN ? = 1 THEN NULL ELSE siphon_revision
-                    END,
-                    siphon_synced_at = CASE
-                        WHEN ? = 1 THEN NULL ELSE siphon_synced_at
-                    END,
                     updated_at = ?
                 WHERE guild_id = ? AND discord_user_id = ?
                 """,
@@ -2318,9 +2297,6 @@ def apply_lootsplit(
                     updated,
                     all_time_earnings,
                     next_revision,
-                    revision_increment,
-                    revision_increment,
-                    revision_increment,
                     now,
                     guild_id,
                     discord_user_id,
@@ -2487,6 +2463,8 @@ def list_negative_siphon(
     max_age_seconds: Optional[int] = None,
     database_path: DatabasePath = None,
 ) -> list[BalanceSnapshot]:
+    """Read stored negative Siphon values independently of later player revisions."""
+
     _validate_identifier(guild_id, "guild_id")
     _validate_boolean(active_only, "active_only")
     if max_age_seconds is not None and (
@@ -2510,8 +2488,6 @@ def list_negative_siphon(
             SELECT * FROM registered_players
             WHERE guild_id = ?
                 AND siphon < 0
-                AND siphon_revision = revision
-                AND siphon_synced_at IS NOT NULL
                 {active_clause}
                 {freshness_clause}
             ORDER BY siphon ASC, nickname_key, discord_user_id
@@ -2527,7 +2503,9 @@ def list_negative_siphon(
                 all_time_earnings=int(row["all_time_earnings"]),
                 revision=int(row["revision"]),
                 siphon=int(row["siphon"]),
-                siphon_revision=int(row["siphon_revision"]),
+                siphon_revision=(
+                    None if row["siphon_revision"] is None else int(row["siphon_revision"])
+                ),
                 siphon_synced_at=row["siphon_synced_at"],
                 is_active=bool(row["is_active"]),
             )

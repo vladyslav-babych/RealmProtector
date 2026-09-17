@@ -53,8 +53,18 @@ def create_feature_commands(bot: "RealmProtectorBot") -> list[app_commands.Comma
         description="Append the current UTC time to the server name",
     )
     @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
     async def add_utc_timer(interaction: discord.Interaction) -> None:
         await utc_timer.handle_add_utc_timer_slash(interaction)
+
+    @app_commands.command(
+        name="remove-utc-timer",
+        description="Remove the UTC timer and restore the original server name",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def remove_utc_timer(interaction: discord.Interaction) -> None:
+        await utc_timer.handle_remove_utc_timer_slash(interaction)
 
     return [
         trial_setup_command,
@@ -63,4 +73,5 @@ def create_feature_commands(bot: "RealmProtectorBot") -> list[app_commands.Comma
         role_reaction_setup,
         set_objective_panel,
         add_utc_timer,
+        remove_utc_timer,
     ]

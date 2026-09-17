@@ -89,8 +89,8 @@ def _format_sync_health(health: sync_operations.SyncHealth) -> str:
         f"Initial Sheet cutover ready: **{'yes' if health.cutover_ready else 'no'}**",
         *queue_lines,
         (
-            "Current Siphon cache: "
-            f"{health.current_siphon_players}/{health.active_players} active players"
+            "Stored Siphon values: "
+            f"{health.cached_siphon_players}/{health.active_players} active players"
         ),
         f"Latest manual Siphon synchronization: {health.latest_siphon_sync_at or 'never'}",
     ]

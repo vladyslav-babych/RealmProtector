@@ -98,6 +98,26 @@ class GuildSettingsTests(unittest.TestCase):
         with self.assertRaises(document_store.DocumentCorruptionError):
             guild_settings.get_configuration(10)
 
+    def test_clear_timer_preserves_other_settings_and_other_guilds(self) -> None:
+        guild_settings.set_target_guild(10, "First")
+        guild_settings.set_bot_updates_channel(10, 100)
+        guild_settings.set_target_guild(11, "Second")
+        guild_settings.set_utc_timer_guild_name(11, "Second name")
+        first_before = document_store.get_mapping_entry("guild_settings", 10)
+        second_before = document_store.get_mapping_entry("guild_settings", 11)
+        guild_settings.set_utc_timer_guild_name(10, "First name")
+        first_with_timer = document_store.get_mapping_entry("guild_settings", 10)
+        first_with_timer["utc_timer_channel_id"] = "123"
+        document_store.upsert_mapping_entry("guild_settings", 10, first_with_timer)
+
+        self.assertTrue(guild_settings.clear_utc_timer_guild_name(10))
+        self.assertEqual(first_before, document_store.get_mapping_entry("guild_settings", 10))
+        self.assertEqual(second_before, document_store.get_mapping_entry("guild_settings", 11))
+        self.assertEqual({11: "Second name"}, guild_settings.get_all_utc_timer_guild_names())
+        self.assertTrue(guild_settings.clear_utc_timer_guild_name(10))
+        self.assertFalse(guild_settings.clear_utc_timer_guild_name(12))
+        self.assertIsNone(document_store.get_mapping_entry("guild_settings", 12))
+
     def test_row_update_does_not_rewrite_another_guild(self) -> None:
         guild_settings.set_target_guild(10, "First")
         guild_settings.set_target_guild(11, "Second")

@@ -8,7 +8,7 @@ from src.realm_protector.services import google_sync, sync_operations
 
 
 class SyncOperationsTests(unittest.IsolatedAsyncioTestCase):
-    def test_health_uses_active_ledger_and_reports_current_siphon_only(self) -> None:
+    def test_health_counts_stored_siphon_even_after_player_revision_changes(self) -> None:
         outbox = local_repository.OutboxStatus(
             guild_id=71,
             pending_events=2,
@@ -32,6 +32,8 @@ class SyncOperationsTests(unittest.IsolatedAsyncioTestCase):
                 revision=3,
                 siphon_synced_at="2026-08-22T10:03:00+00:00",
             ),
+            SimpleNamespace(siphon=0, siphon_synced_at="2026-08-22T10:03:00+00:00"),
+            SimpleNamespace(siphon=None, siphon_synced_at=None),
         ]
         with (
             patch.object(
@@ -73,8 +75,8 @@ class SyncOperationsTests(unittest.IsolatedAsyncioTestCase):
             health = sync_operations.get_sync_health(7)
 
         self.assertEqual(71, health.ledger_id)
-        self.assertEqual(2, health.active_players)
-        self.assertEqual(1, health.current_siphon_players)
+        self.assertEqual(4, health.active_players)
+        self.assertEqual(3, health.cached_siphon_players)
         self.assertEqual("2026-08-22T10:03:00+00:00", health.latest_siphon_sync_at)
         self.assertIs(outbox, health.outbox)
 
@@ -191,7 +193,7 @@ class SyncCommandTests(unittest.IsolatedAsyncioTestCase):
             google_credentials_readable=False,
             cutover_ready=True,
             active_players=0,
-            current_siphon_players=0,
+            cached_siphon_players=0,
             latest_siphon_sync_at=None,
             outbox=None,
         )
