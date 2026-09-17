@@ -8,6 +8,11 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ### Added
 
+- `/bal-remove` can target a registered player by Discord member, numeric Discord
+  ID or exact case-insensitive Albion nickname. Exactly one target is required,
+  and ID/nickname lookups remain scoped to the server's active local ledger.
+- Admin-only `/remove-utc-timer` restores the saved original server name and
+  disables the timer across restarts without removing other bot configuration.
 - Persistent **Update Config** controls for bot/Google Sheets, ticket, trial,
   reaction-role, and objectives configuration. Private administrator-only editors
   provide field selection, current/new previews, explicit saving and cancellation.
@@ -26,6 +31,12 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ### Changed
 
+- Siphon values and their original sync metadata are preserved when balances,
+  lootsplits, membership or registered character details change. Balance panels,
+  negative-Siphon lists and sync status use stored values regardless of later
+  player revisions; explicit `/sync-siphon` snapshot validation is unchanged.
+- UTC server-name timers now display the current minute and attempt updates every
+  minute instead of every five minutes, while respecting Discord's rate limits.
 - Ticket/trial title and welcome-message changes refresh existing live panels;
   character stats, player fields, archive history and existing lifecycle/access
   settings are preserved. Category/role/archive changes affect future tickets/trials.
@@ -51,6 +62,8 @@ This project aims to follow [Keep a Changelog](https://keepachangelog.com/en/1.1
 
 ### Fixed
 
+- Failed UTC server-name updates no longer report that the timer is already
+  configured. Failed timer removal preserves the original name for a safe retry.
 - One-time, audited startup repair for the known JimmyCoacaza/Mamaliga character-ID
   mismatch in the original TEAM CASUALTY ledger. Only the exact affected account's
   Albion ID is corrected; balances, earnings, membership, Siphon and history remain

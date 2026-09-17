@@ -765,7 +765,8 @@ class ForceRegistrationSQLiteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(400, player.silver)
         self.assertEqual(500, player.all_time_earnings)
         self.assertGreater(player.revision, original.revision)
-        self.assertIsNone(player.siphon)
+        self.assertEqual(-10, player.siphon)
+        self.assertEqual(original.revision, player.siphon_revision)
         with sqlite_database.connection() as database:
             self.assertEqual(
                 history_before,

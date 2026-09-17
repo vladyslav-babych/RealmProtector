@@ -576,7 +576,7 @@ class EconomyRepositoryTests(LocalRepositoryTestCase):
             ).siphon
         )
 
-    def test_revision_changes_invalidate_siphon_for_every_player_mutation(self) -> None:
+    def test_revision_changes_preserve_siphon_and_its_original_sync_metadata(self) -> None:
         def cache_current() -> local_repository.PlayerRecord:
             player = local_repository.get_player(
                 10,
@@ -593,6 +593,12 @@ class EconomyRepositoryTests(LocalRepositoryTestCase):
             self.assertEqual(cached.revision, cached.siphon_revision)
             return cached
 
+        def assert_preserved(before, after) -> None:
+            self.assertEqual(before.revision + 1, after.revision)
+            self.assertEqual(before.siphon, after.siphon)
+            self.assertEqual(before.siphon_revision, after.siphon_revision)
+            self.assertEqual(before.siphon_synced_at, after.siphon_synced_at)
+
         before_membership = cache_current()
         inactive = local_repository.set_in_guild(
             10,
@@ -600,10 +606,7 @@ class EconomyRepositoryTests(LocalRepositoryTestCase):
             False,
             database_path=self.database_path,
         )
-        self.assertEqual(before_membership.revision + 1, inactive.revision)
-        self.assertIsNone(inactive.siphon)
-        self.assertIsNone(inactive.siphon_revision)
-        self.assertIsNone(inactive.siphon_synced_at)
+        assert_preserved(before_membership, inactive)
 
         before_reactivation = cache_current()
         reactivated = local_repository.register_player(
@@ -612,26 +615,33 @@ class EconomyRepositoryTests(LocalRepositoryTestCase):
             "Treasurer",
             database_path=self.database_path,
         ).player
-        self.assertEqual(before_reactivation.revision + 1, reactivated.revision)
-        self.assertIsNone(reactivated.siphon)
+        assert_preserved(before_reactivation, reactivated)
 
         before_balance = cache_current()
         changed = local_repository.change_balance(
             10,
             20,
             1,
-            idempotency_key="invalidate-siphon-balance",
+            idempotency_key="preserve-siphon-balance",
             database_path=self.database_path,
         ).player
-        self.assertEqual(before_balance.revision + 1, changed.revision)
-        self.assertIsNone(changed.siphon)
+        assert_preserved(before_balance, changed)
+
+        removed = local_repository.change_balance(
+            10,
+            20,
+            -1,
+            idempotency_key="preserve-siphon-debit",
+            database_path=self.database_path,
+        ).player
+        assert_preserved(changed, removed)
 
         before_lootsplit = cache_current()
         local_repository.apply_lootsplit(
             10,
             ["Treasurer"],
             1,
-            idempotency_key="invalidate-siphon-lootsplit",
+            idempotency_key="preserve-siphon-lootsplit",
             database_path=self.database_path,
         )
         after_lootsplit = local_repository.get_player(
@@ -639,8 +649,44 @@ class EconomyRepositoryTests(LocalRepositoryTestCase):
             20,
             database_path=self.database_path,
         )
-        self.assertEqual(before_lootsplit.revision + 1, after_lootsplit.revision)
-        self.assertIsNone(after_lootsplit.siphon)
+        assert_preserved(before_lootsplit, after_lootsplit)
+
+        renamed = local_repository.register_player(
+            10,
+            20,
+            "NewCharacter",
+            "new-albion-id",
+            replace_character=True,
+            database_path=self.database_path,
+        ).player
+        assert_preserved(after_lootsplit, renamed)
+
+        # Reinitializing/opening SQLite on restart must preserve the old snapshot.
+        local_repository.ensure_schema(self.database_path)
+        snapshot = local_repository.get_balance_snapshot(10, 20, database_path=self.database_path)
+        self.assertEqual(-25, snapshot.siphon)
+        self.assertEqual(before_lootsplit.siphon_revision, snapshot.siphon_revision)
+        self.assertEqual(before_lootsplit.siphon_synced_at, snapshot.siphon_synced_at)
+        self.assertGreater(snapshot.revision, snapshot.siphon_revision)
+
+        refreshed = local_repository.cache_siphon(
+            10, 20, 50, expected_revision=snapshot.revision, database_path=self.database_path
+        ).player
+        self.assertEqual(50, refreshed.siphon)
+        self.assertEqual(refreshed.revision, refreshed.siphon_revision)
+
+    def test_balance_changes_preserve_zero_and_positive_siphon(self) -> None:
+        for siphon in (0, 25):
+            with self.subTest(siphon=siphon):
+                cached = local_repository.cache_siphon(
+                    10, 20, siphon, database_path=self.database_path
+                ).player
+                changed = local_repository.change_balance(
+                    10, 20, 1, database_path=self.database_path
+                ).player
+                self.assertEqual(siphon, changed.siphon)
+                self.assertEqual(cached.siphon_revision, changed.siphon_revision)
+                self.assertEqual(cached.siphon_synced_at, changed.siphon_synced_at)
 
     def test_replacement_snapshot_clears_unseen_and_rejected_cached_values(self) -> None:
         first = local_repository.get_player(
@@ -687,7 +733,7 @@ class EconomyRepositoryTests(LocalRepositoryTestCase):
         self.assertIsNone(unseen.siphon_revision)
         self.assertIsNone(unseen.siphon_synced_at)
 
-    def test_negative_siphon_requires_current_revision_and_optional_freshness(self) -> None:
+    def test_negative_siphon_uses_saved_values_with_optional_freshness(self) -> None:
         player = local_repository.get_player(
             10,
             20,
@@ -721,21 +767,36 @@ class EconomyRepositoryTests(LocalRepositoryTestCase):
             ),
         )
 
-        with sqlite_database.transaction(self.database_path) as connection:
-            connection.execute(
-                """
-                UPDATE registered_players
-                SET revision = revision + 1
-                WHERE guild_id = 10 AND discord_user_id = 20
-                """
-            )
+        local_repository.change_balance(10, 20, 1, database_path=self.database_path)
+        saved = local_repository.list_negative_siphon(
+            10, active_only=True, database_path=self.database_path
+        )
+        self.assertEqual([20], [snapshot.discord_user_id for snapshot in saved])
+        self.assertEqual(-25, saved[0].siphon)
+        self.assertNotEqual(saved[0].revision, saved[0].siphon_revision)
+
+        local_repository.set_in_guild(10, 20, False, database_path=self.database_path)
         self.assertEqual(
             [],
             local_repository.list_negative_siphon(
-                10,
-                database_path=self.database_path,
+                10, active_only=True, database_path=self.database_path
             ),
         )
+        self.assertEqual(
+            -25,
+            local_repository.list_negative_siphon(10, database_path=self.database_path)[0].siphon,
+        )
+
+    def test_negative_siphon_accepts_a_stored_value_without_revision_metadata(self) -> None:
+        with sqlite_database.transaction(self.database_path) as connection:
+            connection.execute(
+                "UPDATE registered_players SET siphon = -25 "
+                "WHERE guild_id = 10 AND discord_user_id = 20"
+            )
+
+        saved = local_repository.list_negative_siphon(10, database_path=self.database_path)
+        self.assertEqual([20], [snapshot.discord_user_id for snapshot in saved])
+        self.assertIsNone(saved[0].siphon_revision)
 
 
 class OutboxAndImportRepositoryTests(LocalRepositoryTestCase):

@@ -19,6 +19,7 @@ EXPECTED_SLASH_COMMANDS = {
     "force-register",
     "lootsplit",
     "register",
+    "remove-utc-timer",
     "role-reaction-setup",
     "set-objective-panel",
     "sync-rebuild",
@@ -35,7 +36,13 @@ EXPECTED_PARAMETERS = {
     "add-utc-timer": [],
     "bal": [("member", False)],
     "bal-add": [("member", True), ("add_silver", True), ("reason", False)],
-    "bal-remove": [("member", True), ("remove_silver", True), ("reason", False)],
+    "bal-remove": [
+        ("remove_silver", True),
+        ("member", False),
+        ("discord_id", False),
+        ("albion_nickname", False),
+        ("reason", False),
+    ],
     "bot-link-google-sheet": [],
     "bot-remove": [],
     "bot-setup": [],
@@ -52,6 +59,7 @@ EXPECTED_PARAMETERS = {
         ("officer", False),
     ],
     "register": [("character_name", True)],
+    "remove-utc-timer": [],
     "role-reaction-setup": [],
     "set-objective-panel": [],
     "sync-rebuild": [],
@@ -131,7 +139,10 @@ class BotCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
                     EXPECTED_SLASH_COMMANDS,
                     {command.name for command in bot.tree.get_commands()},
                 )
-                self.assertEqual(23, len(bot.tree.get_commands()))
+                for name in ("add-utc-timer", "remove-utc-timer"):
+                    command = bot.tree.get_command(name)
+                    self.assertTrue(command.guild_only)
+                    self.assertTrue(command.default_permissions.administrator)
                 self.assertEqual(
                     EXPECTED_PARAMETERS,
                     {

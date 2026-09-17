@@ -161,6 +161,7 @@ Google synchronization, and transactional balance accounting.
 - `/bal-remove`
 - `/clear`
 - `/add-utc-timer`
+- `/remove-utc-timer`
 - `/sync-status`
 - `/sync-retry`
 - `/sync-rebuild`
@@ -169,7 +170,7 @@ Google synchronization, and transactional balance accounting.
 ## Permissions model
 
 - Admin-only:
-	- `/bot-setup`, `/bot-link-google-sheet`, `/tickets-setup`, `/role-reaction-setup`, `/set-objective-panel`, `/update-config`, `/bot-remove`, `/force-register`, `/clear`, `/add-utc-timer`, `/sync-status`, `/sync-retry`, `/sync-rebuild`
+	- `/bot-setup`, `/bot-link-google-sheet`, `/tickets-setup`, `/role-reaction-setup`, `/set-objective-panel`, `/update-config`, `/bot-remove`, `/force-register`, `/clear`, `/add-utc-timer`, `/remove-utc-timer`, `/sync-status`, `/sync-retry`, `/sync-rebuild`
 - Economy operations (`/lootsplit`, `/get-negative-siphon`, `/sync-siphon`, `/bal-add`, `/bal-remove`):
 	- Allowed for Admins OR members with configured Economy Manager role(s)
 - Comp officer actions (`!create-comp`, forced sign-up/sign-out in party threads):
@@ -522,10 +523,20 @@ Admin command that posts or updates a persistent **Objectives panel** in the cur
 Admin command that appends the current UTC time to the server name in `Server Name [HH:MM]` format.
 
 - Requires the server to be configured first via `/bot-setup`.
-- The bot updates the server name every five minutes.
+- The bot attempts to update the server name on every UTC minute boundary, displaying the current minute without five-minute rounding. Discord API rate limits can delay actual name changes; the bot respects these limits.
 - The original server name is stored and reused as the base, so the UTC suffix is always appended to the clean name.
 - Running the command again reuses the stored base name and refreshes the current UTC suffix.
 - The bot needs the `Manage Server` permission to rename the guild.
+- The saved SQLite configuration is restored automatically after a bot restart.
+
+### `/remove-utc-timer`
+
+Admin command that restores the saved original server name and disables the UTC timer without changing other bot settings or panels.
+
+- Requires the bot's `Manage Server` permission; the confirmation is visible only to the administrator who ran the command.
+- After successful removal, the timer stays disabled across bot restarts.
+- If Discord cannot restore the name, the command reports the failure and keeps the timer configuration and original name. Fix any permission issue and run `/remove-utc-timer` again.
+- Running it when no timer is configured leaves the server name unchanged.
 
 ### Adding objectives
 
@@ -637,7 +648,7 @@ Required permissions for notifications:
 
 ### `/bal [member]` and `!bal`
 
-- Reads authoritative Silver and the last valid cached Siphon snapshot from SQLite.
+- Reads authoritative Silver and the last stored Siphon snapshot from SQLite.
 - Displays all-time earnings: the cumulative positive Silver credited by manual
   additions and lootsplits. It appears as a full-width row below the
   **Balance**/**Siphon** row and above **Raw balance**; balance removals never
@@ -648,9 +659,14 @@ Required permissions for notifications:
   invoking user's own balance. All variants share the same balance view and show
   the displayed player's current Silver leaderboard position in the footer.
 - Without Google, Silver remains available and Siphon is shown as unavailable.
-- A Siphon invalidated by a newer local change is shown as pending until an
-  Economy Manager or Admin runs `/sync-siphon`; elapsed time alone does not
-  invalidate an otherwise current value.
+- Balance changes, lootsplits, membership changes and character updates preserve
+  the stored Siphon value and its original synchronization timestamp. Balance
+  panels and `/get-negative-siphon` use that value even if the player has changed
+  since the last sync; `/sync-status` counts it as a stored Siphon value.
+- An Economy Manager or Admin can run `/sync-siphon` to replace the snapshot.
+  Its existing validation still clears missing or rejected Sheet rows. A missing
+  local value is shown as pending; values cleared by older bot versions require
+  another `/sync-siphon` to restore them. Time and restarts do not clear stored values.
 
 ### `!lb`
 
@@ -663,7 +679,15 @@ Required permissions for notifications:
 
 ### `/bal-add` and `/bal-remove`
 
-- Work by Discord member mention.
+- `/bal-add` uses the Discord member picker.
+- `/bal-remove` accepts exactly one target: `member` (Discord member picker),
+  `discord_id` (numeric user ID), or `albion_nickname` (exact registered name,
+  case-insensitive). Lookups use only this server's current local ledger;
+  ID/nickname targets can include registered players who have left the server.
+- Examples:
+  - `/bal-remove remove_silver:1000 member:@User`
+  - `/bal-remove remove_silver:1000 discord_id:936012266321608744`
+  - `/bal-remove remove_silver:1000 albion_nickname:Mamaliga`
 - Validate amount as an integer greater than `0`.
 - Update Silver and immutable Balance History atomically in SQLite:
 	- Date, Reason, Officer, Nickname, Amount

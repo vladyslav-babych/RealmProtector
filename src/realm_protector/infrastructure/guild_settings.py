@@ -399,6 +399,17 @@ def set_utc_timer_guild_name(discord_server_id: int, guild_name: str) -> bool:
     )
 
 
+@_config_transaction
+def clear_utc_timer_guild_name(discord_server_id: int) -> bool:
+    """Disable the name timer without removing any other server configuration."""
+
+    def clear_timer(entry: dict) -> None:
+        entry.pop("utc_timer_guild_name", None)
+        entry.pop("utc_timer_channel_id", None)
+
+    return _update_entry(discord_server_id, clear_timer)
+
+
 def get_utc_timer_guild_name(discord_server_id: int) -> Optional[str]:
     configuration = get_configuration(discord_server_id)
     return configuration.utc_timer_guild_name if configuration is not None else None
@@ -485,6 +496,7 @@ def remove_target_guild_in_transaction(
 __all__ = [
     "GuildConfigurationError",
     "clear_utc_timer_channel",
+    "clear_utc_timer_guild_name",
     "get_all_bot_updates_channels",
     "get_all_configured_server_ids",
     "get_all_utc_timer_guild_names",

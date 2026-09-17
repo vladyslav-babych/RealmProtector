@@ -29,7 +29,7 @@ class SyncHealth:
     google_credentials_readable: bool
     cutover_ready: bool
     active_players: int
-    current_siphon_players: int
+    cached_siphon_players: int
     latest_siphon_sync_at: Optional[str]
     outbox: Optional[local_repository.OutboxStatus]
     quarantine_reason: str = ""
@@ -80,19 +80,14 @@ def get_sync_health(discord_guild_id: int) -> SyncHealth:
             google_credentials_readable=credentials_readable,
             cutover_ready=google_sync.is_cutover_ready(discord_guild_id),
             active_players=0,
-            current_siphon_players=0,
+            cached_siphon_players=0,
             latest_siphon_sync_at=None,
             outbox=None,
             quarantine_reason=quarantine_reason,
         )
 
     players = local_repository.list_active_players(ledger.ledger_id)
-    current_siphon_players = sum(
-        player.siphon is not None
-        and player.siphon_revision == player.revision
-        and bool(player.siphon_synced_at)
-        for player in players
-    )
+    cached_siphon_players = sum(player.siphon is not None for player in players)
     latest_siphon_sync_at = max(
         (player.siphon_synced_at for player in players if player.siphon_synced_at),
         default=None,
@@ -105,7 +100,7 @@ def get_sync_health(discord_guild_id: int) -> SyncHealth:
         google_credentials_readable=credentials_readable,
         cutover_ready=google_sync.is_cutover_ready(discord_guild_id),
         active_players=len(players),
-        current_siphon_players=current_siphon_players,
+        cached_siphon_players=cached_siphon_players,
         latest_siphon_sync_at=latest_siphon_sync_at,
         outbox=local_repository.get_outbox_status(ledger.ledger_id),
         quarantine_reason=quarantine_reason,

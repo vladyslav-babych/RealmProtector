@@ -5,6 +5,37 @@ from unittest.mock import AsyncMock, patch
 from src.realm_protector.bot import economy_commands
 
 
+class SiphonDisplayTests(unittest.TestCase):
+    def test_balance_embed_displays_stored_siphon_regardless_of_player_revision(self) -> None:
+        for siphon in (-1250, 0, 1250):
+            for siphon_revision in (None, 2, 7):
+                with self.subTest(siphon=siphon, siphon_revision=siphon_revision):
+                    snapshot = SimpleNamespace(
+                        silver=75,
+                        all_time_earnings=125,
+                        siphon=siphon,
+                        siphon_revision=siphon_revision,
+                        revision=7,
+                    )
+                    embed = economy_commands._build_balance_embed(
+                        SimpleNamespace(mention="<@20>"), snapshot, google_linked=True
+                    )
+                    self.assertEqual("Siphon", embed.fields[1].name)
+                    self.assertEqual(f"{siphon:,} :oil:", embed.fields[1].value)
+
+    def test_missing_siphon_stays_pending_until_synced(self) -> None:
+        self.assertEqual(
+            "Pending /sync-siphon",
+            economy_commands._format_siphon(SimpleNamespace(siphon=None), google_linked=True),
+        )
+
+    def test_siphon_still_requires_a_google_sheet_link(self) -> None:
+        self.assertEqual(
+            "Unavailable (Google Sheet not linked)",
+            economy_commands._format_siphon(SimpleNamespace(siphon=25), google_linked=False),
+        )
+
+
 class EconomyMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_lootsplit_allows_only_credited_participant_mentions(self) -> None:
         class FakeMember:

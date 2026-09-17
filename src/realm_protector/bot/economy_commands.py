@@ -98,7 +98,7 @@ def _resolve_member_local_name(
 def _format_siphon(snapshot, *, google_linked: bool) -> str:
     if not google_linked:
         return "Unavailable (Google Sheet not linked)"
-    if snapshot.siphon is None or snapshot.siphon_revision != snapshot.revision:
+    if snapshot.siphon is None:
         return "Pending /sync-siphon"
     return f"{snapshot.siphon:,} :oil:"
 
@@ -311,7 +311,7 @@ def register_economy_persistent_views(bot: "RealmProtectorBot") -> None:
 
 def _build_balance_update_embed(
     actor: discord.Member,
-    target: discord.Member,
+    target_discord_id: int,
     action_text: str,
     amount_text: str,
     reason: str,
@@ -324,7 +324,7 @@ def _build_balance_update_embed(
     embed = discord.Embed(
         color=discord.Color.blurple(),
         description=(
-            f"### {actor.mention} {action_text} {amount_text} balance {direction} {target.mention}"
+            f"### {actor.mention} {action_text} {amount_text} balance {direction} <@{target_discord_id}>"
         ),
     )
     embed.add_field(name="Reason", value=reason, inline=False)
@@ -360,12 +360,14 @@ async def _project_linked_players_after_commit(
 
 async def _handle_balance_change(
     interaction: discord.Interaction,
-    member: discord.Member,
+    member: Optional[discord.Member],
     raw_amount: str,
     reason: str,
     *,
     option_name: str,
     remove: bool,
+    discord_id: Optional[str] = None,
+    albion_nickname: Optional[str] = None,
 ) -> None:
     guild = interaction.guild
     actor = interaction.user
@@ -384,6 +386,32 @@ async def _handle_balance_change(
         return
     if not await _ensure_local_ledger_ready(interaction):
         return
+
+    if sum(value is not None for value in (member, discord_id, albion_nickname)) != 1:
+        await interaction.response.send_message(
+            "Choose exactly one player: `member`, `discord_id`, or `albion_nickname`.",
+            ephemeral=True,
+        )
+        return
+    target_discord_id = member.id if member is not None else None
+    if discord_id is not None:
+        normalized_id = discord_id.strip()
+        if (
+            re.fullmatch(r"[0-9]{1,19}", normalized_id) is None
+            or not 0 < int(normalized_id) <= (1 << 63) - 1
+        ):
+            await interaction.response.send_message(
+                "`discord_id` must be a valid numeric Discord user ID.", ephemeral=True
+            )
+            return
+        target_discord_id = int(normalized_id)
+    if albion_nickname is not None:
+        albion_nickname = albion_nickname.strip()
+        if not albion_nickname:
+            await interaction.response.send_message(
+                "`albion_nickname` must not be blank.", ephemeral=True
+            )
+            return
 
     normalized_amount = raw_amount.strip()
     if len(normalized_amount) > len(str(MAX_SILVER_TRANSACTION)):
@@ -424,8 +452,28 @@ async def _handle_balance_change(
     await interaction.response.defer(thinking=True)
     requested_delta = -requested_amount if remove else requested_amount
     async with guild_lifecycle.lock_for(guild.id):
+        if not await economy_access.has_economy_access(actor, guild.id):
+            await interaction.followup.send(
+                "Your economy permissions changed; no balance was changed.", ephemeral=True
+            )
+            return
         try:
             ledger_id = await asyncio.to_thread(_active_ledger_id, guild.id)
+            if albion_nickname is not None:
+                player = await asyncio.to_thread(
+                    local_repository.get_player_by_nickname, ledger_id, albion_nickname
+                )
+                if player is None:
+                    await interaction.followup.send(
+                        "No registered player with that Albion nickname exists in this server.",
+                        ephemeral=True,
+                    )
+                    return
+                target_discord_id = player.discord_user_id
+            # Only the resolved local Discord ID is used for mutation and sync;
+            # the registered player need not still be a member of this server.
+            if target_discord_id is None:
+                raise ValueError("No balance target was resolved")
             actor_name = await asyncio.to_thread(
                 _resolve_member_local_name,
                 ledger_id,
@@ -434,7 +482,7 @@ async def _handle_balance_change(
             result = await asyncio.to_thread(
                 local_repository.change_balance,
                 ledger_id,
-                member.id,
+                target_discord_id,
                 requested_delta,
                 actor_discord_user_id=actor.id,
                 actor_name=actor_name,
@@ -451,16 +499,18 @@ async def _handle_balance_change(
             return
 
     if result is None:
-        await interaction.followup.send(f"{member.mention} is not registered.")
+        await interaction.followup.send(
+            f"<@{target_discord_id}> is not registered in this server.", ephemeral=True
+        )
         return
 
-    projection = await _project_linked_players_after_commit(guild.id, (member.id,))
+    projection = await _project_linked_players_after_commit(guild.id, (target_discord_id,))
     actual_delta = result.actual_delta
     action_text = "removed" if remove else "added"
     amount_text = f"{abs(actual_delta):,}"
     embed = _build_balance_update_embed(
         actor,
-        member,
+        target_discord_id,
         action_text,
         amount_text,
         reason,
@@ -749,10 +799,17 @@ def create_economy_commands(
 
     @app_commands.command(name="bal-remove", description="Remove silver balance from a player")
     @app_commands.guild_only()
+    @app_commands.describe(
+        member="Select a Discord member (choose only one target option)",
+        discord_id="Discord user ID, including registered players who left the server",
+        albion_nickname="Exact registered Albion nickname (case-insensitive)",
+    )
     async def balance_remove(
         interaction: discord.Interaction,
-        member: discord.Member,
         remove_silver: str,
+        member: Optional[discord.Member] = None,
+        discord_id: Optional[str] = None,
+        albion_nickname: Optional[str] = None,
         reason: str = "Payout",
     ) -> None:
         await _handle_balance_change(
@@ -762,6 +819,8 @@ def create_economy_commands(
             reason,
             option_name="remove_silver",
             remove=True,
+            discord_id=discord_id,
+            albion_nickname=albion_nickname,
         )
 
     return [lootsplit, balance, get_negative_siphon, balance_add, balance_remove]
